@@ -26,7 +26,11 @@ Required environment variables:
 
 Optional environment variables:
 
-- `CODEX_TELEGRAM_REPO_DIR` - repository directory for Codex app-server threads; defaults to this repository root.
+- `CODEX_TELEGRAM_REPO_DIR` - repository directory for Codex app-server threads; defaults to the process working directory.
+- `CODEX_TELEGRAM_INSTRUCTIONS_FILE` - optional base instructions file for new and resumed app-server threads.
+  Unset or empty uses Codex's standard instructions. Paths expand `~`; relative paths are resolved against
+  `CODEX_TELEGRAM_REPO_DIR`, and absolute paths are supported. A missing configured file logs a warning and
+  uses standard instructions; other read errors remain fatal.
 - `CODEX_TELEGRAM_APP_SERVER_SOCKET` - Unix socket of the shared Codex app-server; defaults to
   `$CODEX_HOME/app-server-control/app-server-control.sock`, or `~/.codex/app-server-control/app-server-control.sock`
   when `CODEX_HOME` is unset.
@@ -57,10 +61,6 @@ Optional environment variables:
 - `CODEX_TELEGRAM_CHAT_ACTION_INTERVAL_SECONDS` - `sendChatAction` interval; defaults to `5`.
 - `CODEX_TELEGRAM_MAX_CONCURRENT_CHATS` - size of each worker pool used for chat-event processing and
   waiting on concurrent Codex turns; defaults to `16`.
-
-New and resumed app-server threads use `tools/codex_telegram_bot/instructions.md` as their base instructions.
-If that file is missing, the bot logs a warning and omits the override so Codex uses its standard instructions.
-Other errors while reading the file remain fatal.
 - `CODEX_TELEGRAM_DELETE_WEBHOOK_ON_START` - remove an existing Telegram webhook before polling; defaults to `false`.
 - `CODEX_TELEGRAM_DROP_PENDING_UPDATES` - drop queued updates when deleting the webhook; defaults to `false`.
 - `CODEX_TELEGRAM_LOG_LEVEL` - Python logging level; defaults to `INFO`.

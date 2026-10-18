@@ -106,6 +106,78 @@ class ConfigurationTest(unittest.TestCase):
     def test_parse_multiple_chat_ids(self) -> None:
         self.assertEqual(parse_chat_ids("TEST_IDS", "-1001, -1002"), frozenset({-1001, -1002}))
 
+    def test_repository_uses_process_working_directory_unless_overridden(self) -> None:
+        previous_dir = Path.cwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            working_dir = root / "working"
+            override_dir = root / "configured"
+            working_dir.mkdir()
+            override_dir.mkdir()
+            try:
+                os.chdir(working_dir)
+                for configured_repo, expected_repo in (
+                    (None, working_dir),
+                    ("", working_dir),
+                    (str(override_dir), override_dir),
+                    ("../configured", override_dir),
+                ):
+                    with self.subTest(configured_repo=configured_repo):
+                        environment = {
+                            "TELEGRAM_BOT_TOKEN": "test-token",
+                            "TELEGRAM_ALLOWED_CHAT_IDS": "-1001",
+                            "PWD": str(root / "incorrect-pwd"),
+                        }
+                        if configured_repo is not None:
+                            environment["CODEX_TELEGRAM_REPO_DIR"] = configured_repo
+                        with patch.dict(os.environ, environment, clear=True):
+                            config = Config.from_env()
+
+                        self.assertEqual(config.repo_dir, expected_repo)
+                        self.assertEqual(
+                            config.session_store_path,
+                            expected_repo / "sessions.json",
+                        )
+            finally:
+                os.chdir(previous_dir)
+
+    def test_instructions_file_is_optional(self) -> None:
+        for value in (None, ""):
+            with self.subTest(value=value):
+                environment = {
+                    "TELEGRAM_BOT_TOKEN": "test-token",
+                    "TELEGRAM_ALLOWED_CHAT_IDS": "-1001",
+                }
+                if value is not None:
+                    environment["CODEX_TELEGRAM_INSTRUCTIONS_FILE"] = value
+                with patch.dict(os.environ, environment, clear=True):
+                    config = Config.from_env()
+
+                self.assertIsNone(config.instructions_file)
+
+    def test_instructions_file_resolves_relative_absolute_and_home_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            repo_dir = root / "repo"
+            environment = {
+                "TELEGRAM_BOT_TOKEN": "test-token",
+                "TELEGRAM_ALLOWED_CHAT_IDS": "-1001",
+                "CODEX_TELEGRAM_REPO_DIR": str(repo_dir),
+            }
+            with patch.dict(os.environ, environment, clear=True):
+                for value, expected in (
+                    ("instructions.md", repo_dir / "instructions.md"),
+                    ("../shared/instructions.md", root / "shared" / "instructions.md"),
+                    (str(root / "external.md"), root / "external.md"),
+                    ("~/telegram-instructions.md", Path.home() / "telegram-instructions.md"),
+                ):
+                    with self.subTest(value=value):
+                        os.environ["CODEX_TELEGRAM_INSTRUCTIONS_FILE"] = value
+
+                        config = Config.from_env()
+
+                        self.assertEqual(config.instructions_file, expected.resolve())
+
     def test_read_only_defaults_to_true(self) -> None:
         environment = {
             "TELEGRAM_BOT_TOKEN": "test-token",
@@ -4218,8 +4290,7 @@ class CodexProgressLoggingTest(unittest.TestCase):
     def test_thread_start_and_resume_use_project_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_dir = Path(temp_dir).resolve()
-            instructions_path = repo_dir / "tools" / "codex_telegram_bot" / "instructions.md"
-            instructions_path.parent.mkdir(parents=True)
+            instructions_path = repo_dir / "custom-instructions.md"
             instructions_path.write_text("Telegram bot instructions", encoding="utf-8")
             for read_only, sandbox, approval_policy in (
                 (True, "read-only", "never"),
@@ -4227,7 +4298,11 @@ class CodexProgressLoggingTest(unittest.TestCase):
             ):
                 with self.subTest(read_only=read_only):
                     client = CodexAppServerClient(
-                        build_config(repo_dir, read_only=read_only),
+                        build_config(
+                            repo_dir,
+                            read_only=read_only,
+                            instructions_file=instructions_path,
+                        ),
                     )
                     client.request = MagicMock(
                         side_effect=[
@@ -4260,24 +4335,72 @@ class CodexProgressLoggingTest(unittest.TestCase):
                     self.assertEqual(start_params["threadSource"], "codex_telegram_bot")
                     self.assertEqual(resume_params["threadId"], "thread-one")
 
-    def test_missing_project_instructions_fall_back_to_standard_instructions(self) -> None:
+    def test_unconfigured_instructions_omit_override_without_warning(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_dir = Path(temp_dir).resolve()
+            legacy_path = repo_dir / "tools" / "codex_telegram_bot" / "instructions.md"
+            legacy_path.parent.mkdir(parents=True)
+            legacy_path.write_text("Unconfigured legacy instructions", encoding="utf-8")
             client = CodexAppServerClient(build_config(repo_dir))
+            client.request = MagicMock(return_value={"thread": {"id": "thread-one"}})
+
+            with patch("bot.logger.warning") as warning:
+                self.assertEqual(client.start_thread(), "thread-one")
+                client.resume_thread("thread-one")
+
+        warning.assert_not_called()
+        for request_call in client.request.call_args_list:
+            self.assertNotIn("baseInstructions", request_call.args[1])
+
+    def test_missing_configured_instructions_fall_back_to_standard_instructions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir).resolve()
+            missing_path = repo_dir / "missing-instructions.md"
+            client = CodexAppServerClient(
+                build_config(repo_dir, instructions_file=missing_path),
+            )
             client.request = MagicMock(return_value={"thread": {"id": "thread-one"}})
 
             with self.assertLogs("bot", level="WARNING") as logs:
                 self.assertEqual(client.start_thread(), "thread-one")
+                client.resume_thread("thread-one")
 
-        params = client.request.call_args.args[1]
-        self.assertNotIn("baseInstructions", params)
+        for request_call in client.request.call_args_list:
+            self.assertNotIn("baseInstructions", request_call.args[1])
         self.assertTrue(
             any(
                 "instructions file" in message
+                and str(missing_path) in message
                 and "using standard Codex instructions" in message
                 for message in logs.output
             ),
         )
+
+    def test_unreadable_configured_instructions_fail_before_server_request(self) -> None:
+        for method in ("start_thread", "resume_thread"):
+            with self.subTest(method=method):
+                client = CodexAppServerClient(
+                    build_config(
+                        Path("/repo"),
+                        instructions_file=Path("/repo/protected-instructions.md"),
+                    ),
+                )
+                client.request = MagicMock()
+                with patch(
+                    "bot.Path.read_text",
+                    side_effect=PermissionError("permission denied"),
+                ):
+                    with self.assertRaisesRegex(
+                        CodexAppServerError,
+                        "cannot read Codex bot instructions",
+                    ) as raised:
+                        if method == "start_thread":
+                            client.start_thread()
+                        else:
+                            client.resume_thread("thread-one")
+
+                self.assertIsInstance(raised.exception.__cause__, PermissionError)
+                client.request.assert_not_called()
 
     def test_thread_name_uses_dedicated_app_server_method(self) -> None:
         client = CodexAppServerClient(build_config(Path("/repo")))
@@ -4294,16 +4417,11 @@ class CodexProgressLoggingTest(unittest.TestCase):
         )
 
     def test_thread_configuration_includes_dynamic_tools_when_requested(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_dir = Path(temp_dir).resolve()
-            instructions_path = repo_dir / "tools" / "codex_telegram_bot" / "instructions.md"
-            instructions_path.parent.mkdir(parents=True)
-            instructions_path.write_text("Telegram bot instructions", encoding="utf-8")
-            client = CodexAppServerClient(build_config(repo_dir))
-            client.request = MagicMock(return_value={"thread": {"id": "thread-one"}})
-            tools = [telegram_reaction_tool_spec()]
+        client = CodexAppServerClient(build_config(Path("/repo")))
+        client.request = MagicMock(return_value={"thread": {"id": "thread-one"}})
+        tools = [telegram_reaction_tool_spec()]
 
-            client.start_thread(tools)
+        client.start_thread(tools)
 
         self.assertEqual(client.request.call_args.args[1]["dynamicTools"], tools)
 
@@ -5299,6 +5417,7 @@ def build_config(
     *,
     sticker_dir: Path | None = None,
     read_only: bool = True,
+    instructions_file: Path | None = None,
 ) -> Config:
     return Config(
         telegram_bot_token="test-token",
@@ -5321,6 +5440,7 @@ def build_config(
         drop_pending_updates_on_webhook_delete=False,
         sticker_dir=sticker_dir,
         read_only=read_only,
+        instructions_file=instructions_file,
     )
 
 

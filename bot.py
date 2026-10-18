@@ -143,6 +143,7 @@ class Config:
     max_concurrent_chats: int = DEFAULT_MAX_CONCURRENT_CHATS
     sticker_dir: Path | None = None
     read_only: bool = True
+    instructions_file: Path | None = None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -161,8 +162,8 @@ class Config:
         allowed_chat_ids = parse_chat_ids(allowed_chat_ids_name, allowed_chat_ids_raw)
 
         repo_dir = Path(
-            os.environ.get("CODEX_TELEGRAM_REPO_DIR", Path(__file__).resolve().parents[2]),
-        ).resolve()
+            os.environ.get("CODEX_TELEGRAM_REPO_DIR", Path.cwd()),
+        ).expanduser().resolve()
 
         codex_timeout_seconds = read_optional_int("CODEX_TELEGRAM_CODEX_TIMEOUT_SECONDS")
         codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
@@ -221,6 +222,10 @@ class Config:
             ),
             sticker_dir=sticker_dir,
             read_only=read_bool("CODEX_TELEGRAM_READ_ONLY", True),
+            instructions_file=resolve_repo_relative_path(
+                os.environ.get("CODEX_TELEGRAM_INSTRUCTIONS_FILE"),
+                repo_dir,
+            ),
         )
 
 
@@ -2036,21 +2041,20 @@ class CodexAppServerClient:
         self,
         dynamic_tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        instructions_path = (
-            self.config.repo_dir / "tools" / "codex_telegram_bot" / "instructions.md"
-        ).resolve()
-        try:
-            base_instructions = instructions_path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            logger.warning(
-                "Codex bot instructions file %s is missing; using standard Codex instructions",
-                instructions_path,
-            )
-            base_instructions = None
-        except OSError as err:
-            raise CodexAppServerError(
-                f"cannot read Codex bot instructions from {instructions_path}: {err}",
-            ) from err
+        instructions_path = self.config.instructions_file
+        base_instructions = None
+        if instructions_path is not None:
+            try:
+                base_instructions = instructions_path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                logger.warning(
+                    "Codex bot instructions file %s is missing; using standard Codex instructions",
+                    instructions_path,
+                )
+            except OSError as err:
+                raise CodexAppServerError(
+                    f"cannot read Codex bot instructions from {instructions_path}: {err}",
+                ) from err
 
         configuration = {
             "cwd": str(self.config.repo_dir),
