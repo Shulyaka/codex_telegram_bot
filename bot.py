@@ -11,6 +11,7 @@ import queue
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import tempfile
 import threading
@@ -19,8 +20,9 @@ import uuid
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from html import escape
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Coroutine, Iterator
+from typing import Any, Awaitable, BinaryIO, Callable, Coroutine, Iterator
 from urllib.parse import unquote, urlsplit
 
 try:
@@ -61,6 +63,7 @@ TELEGRAM_REQUEST_ATTEMPTS = 4
 TELEGRAM_NETWORK_RETRY_DELAY_SECONDS = 0.5
 MAX_TELEGRAM_RICH_MEDIA = 50
 MAX_TELEGRAM_PHOTO_BYTES = 10 * 1024 * 1024
+MAX_TELEGRAM_DOCUMENT_BYTES = 50 * 1024 * 1024
 TELEGRAM_MEDIA_PLACEHOLDER_PREFIX = "https://codex-telegram.invalid/media/"
 TELEGRAM_PHOTO_URI_PREFIX = "tg://photo?id="
 MARKDOWN_IMAGE_PATTERN = re.compile(
@@ -91,6 +94,7 @@ TOPIC_CONVERSATION_PREFIX = "topic:"
 TELEGRAM_REACTION_TOOL_NAME = "react_to_telegram_message"
 TELEGRAM_CLEAR_REACTION_TOOL_NAME = "clear_telegram_reaction"
 TELEGRAM_STICKER_TOOL_NAME = "send_sticker"
+TELEGRAM_FILE_TOOL_NAME = "send_file"
 TELEGRAM_REACTION_EMOJIS = tuple(reaction.value for reaction in ReactionEmoji)
 
 ConversationKey = int | str
@@ -144,6 +148,7 @@ class Config:
     sticker_dir: Path | None = None
     read_only: bool = True
     instructions_file: Path | None = None
+    upload_dir: Path | None = None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -226,6 +231,10 @@ class Config:
                 os.environ.get("CODEX_TELEGRAM_INSTRUCTIONS_FILE"),
                 repo_dir,
             ),
+            upload_dir=configured_upload_dir(resolve_repo_relative_path(
+                os.environ.get("CODEX_TELEGRAM_UPLOAD_DIR"),
+                repo_dir,
+            )),
         )
 
 
@@ -292,6 +301,22 @@ class QueuedTelegramSticker:
     name: str
     path: Path
     steer_count: int
+
+
+@dataclass(frozen=True)
+class QueuedTelegramFile:
+    path: Path
+    caption: str | None = None
+    upload_dir: Path | None = None
+
+
+@dataclass(frozen=True)
+class DeferredTelegramAction:
+    run: Callable[[], None]
+    cancel: Callable[[], None]
+
+    def __call__(self) -> None:
+        self.run()
 
 
 @dataclass
@@ -744,6 +769,84 @@ def path_is_within(path: Path, root: Path) -> bool:
     return True
 
 
+def configured_upload_dir(path: Path | None) -> Path | None:
+    if path is None:
+        return None
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+        if not resolved.is_dir():
+            raise ValueError("the configured path is not a directory")
+    except (OSError, RuntimeError, ValueError) as err:
+        raise ValueError(
+            f"CODEX_TELEGRAM_UPLOAD_DIR must name an existing directory: {path}",
+        ) from err
+    return resolved
+
+
+def _validate_upload_file_stat(file_stat: os.stat_result, path: Path) -> None:
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise ValueError(f"upload path is not a regular file: {path}")
+    if file_stat.st_size <= 0:
+        raise ValueError(f"upload file is empty: {path}")
+    if file_stat.st_size > MAX_TELEGRAM_DOCUMENT_BYTES:
+        raise ValueError(
+            f"upload file exceeds Telegram's {MAX_TELEGRAM_DOCUMENT_BYTES}-byte "
+            f"document limit: {path}",
+        )
+
+
+def validate_upload_file(path: Path, upload_dir: Path) -> Path:
+    # The configured directory is canonicalized once at startup. Keep that fixed
+    # boundary if a directory is subsequently replaced with a symlink.
+    root = upload_dir.expanduser().absolute()
+    candidate = path.expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+        if not path_is_within(resolved, root):
+            raise ValueError(
+                f"upload file is outside CODEX_TELEGRAM_UPLOAD_DIR: {path}",
+            )
+        _validate_upload_file_stat(resolved.stat(), resolved)
+    except (OSError, RuntimeError) as err:
+        raise ValueError(f"upload file is unavailable: {path}") from err
+    return resolved
+
+
+@contextlib.contextmanager
+def open_upload_file(path: Path, upload_dir: Path) -> Iterator[BinaryIO]:
+    resolved = validate_upload_file(path, upload_dir)
+    directory_fd: int | None = None
+    file_fd: int | None = None
+    try:
+        try:
+            directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            # Open every component relative to a pinned directory descriptor. A
+            # symlink swap between validation and open can never redirect the read.
+            directory_fd = os.open(resolved.anchor, directory_flags)
+            for component in resolved.parts[1:-1]:
+                next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+                os.close(directory_fd)
+                directory_fd = next_fd
+            file_fd = os.open(
+                resolved.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                dir_fd=directory_fd,
+            )
+            _validate_upload_file_stat(os.fstat(file_fd), resolved)
+        except OSError as err:
+            raise ValueError(f"upload file could not be opened safely: {path}") from err
+        with os.fdopen(file_fd, "rb") as file_stream:
+            file_fd = None
+            yield file_stream
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
 def validate_telegram_photo(path: Path) -> Path:
     resolved = path.expanduser().resolve(strict=True)
     if not resolved.is_file():
@@ -1065,6 +1168,7 @@ class TelegramClient:
         guest_query_id: str,
         text: str,
         generated_image_paths: frozenset[Path] = frozenset(),
+        queued_files: tuple[QueuedTelegramFile, ...] = (),
     ) -> None:
         prepared_markdown, references = extract_telegram_rich_media(
             text,
@@ -1080,17 +1184,53 @@ class TelegramClient:
                 uploaded_file_ids[reference.source_url] = uploaded.file_id
                 if uploaded.message_id is not None:
                     upload_message_ids.append(uploaded.message_id)
-            parts = build_telegram_rich_parts(
-                prepared_markdown,
-                references,
-                uploaded_file_ids,
-            )
+            if queued_files and not prepared_markdown.strip():
+                rich_message: dict[str, Any] = {"html": ""}
+            else:
+                parts = build_telegram_rich_parts(
+                    prepared_markdown,
+                    references,
+                    uploaded_file_ids,
+                )
+                rich_message = parts[0].rich_message
+
+            if queued_files:
+                rich_message = dict(rich_message)
+                media = list(rich_message.get("media") or [])
+                if len(media) + len(queued_files) > MAX_TELEGRAM_RICH_MEDIA:
+                    raise ValueError(
+                        f"a guest response can contain at most {MAX_TELEGRAM_RICH_MEDIA} media items",
+                    )
+                document_html = []
+                for index, queued_file in enumerate(queued_files):
+                    uploaded = self.upload_document_for_guest(
+                        queued_file.path,
+                        upload_dir=queued_file.upload_dir,
+                    )
+                    if uploaded.message_id is not None:
+                        upload_message_ids.append(uploaded.message_id)
+                    media_id = f"document_{index}"
+                    document = f'<tg-document src="tg://document?id={media_id}"></tg-document>'
+                    if queued_file.caption:
+                        document = (
+                            f"<figure>{document}<figcaption>"
+                            f"{escape(queued_file.caption)}</figcaption></figure>"
+                        )
+                    document_html.append(document)
+                    media.append(
+                        {
+                            "id": media_id,
+                            "media": {"type": "document", "media": uploaded.file_id},
+                        },
+                    )
+                rich_message["html"] = (rich_message.get("html") or "") + "".join(document_html)
+                rich_message["media"] = media
 
             self._api(
                 "answerGuestQuery",
                 {
                     "guest_query_id": guest_query_id,
-                    "result": self.build_guest_rich_result(parts[0].rich_message),
+                    "result": self.build_guest_rich_result(rich_message),
                 },
             )
         finally:
@@ -1273,6 +1413,70 @@ class TelegramClient:
                 telegram_response_message_id(response),
             )
 
+    def send_document(
+        self,
+        chat_id: int,
+        path: Path,
+        caption: str | None = None,
+        message_thread_id: int | None = None,
+        *,
+        upload_dir: Path | None = None,
+    ) -> int | None:
+        if upload_dir is not None:
+            path = validate_upload_file(path, upload_dir)
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "document": "attach://document",
+        }
+        if caption is not None:
+            payload["caption"] = caption
+        if message_thread_id is not None:
+            payload["message_thread_id"] = message_thread_id
+        if upload_dir is not None:
+            response = self._api_multipart(
+                "sendDocument",
+                payload,
+                {"document": path},
+                upload_roots={"document": upload_dir},
+            )
+        else:
+            response = self._api_multipart("sendDocument", payload, {"document": path})
+        return telegram_response_message_id(response)
+
+    def upload_document_for_guest(
+        self,
+        path: Path,
+        *,
+        upload_dir: Path | None = None,
+    ) -> GuestUploadedPhoto:
+        if self.media_upload_chat_id is None:
+            raise ValueError(
+                "CODEX_TELEGRAM_MEDIA_UPLOAD_CHAT_ID is required to send files in guest responses",
+            )
+        if upload_dir is not None:
+            path = validate_upload_file(path, upload_dir)
+        payload = {
+            "chat_id": self.media_upload_chat_id,
+            "document": "attach://document",
+        }
+        if upload_dir is not None:
+            response = self._api_multipart(
+                "sendDocument",
+                payload,
+                {"document": path},
+                upload_roots={"document": upload_dir},
+            )
+        else:
+            response = self._api_multipart("sendDocument", payload, {"document": path})
+        message_id = telegram_response_message_id(response)
+        try:
+            file_id = telegram_document_file_id(response)
+        except Exception:
+            if message_id is not None:
+                self.delete_guest_upload_messages([message_id])
+            raise
+        return GuestUploadedPhoto(file_id, message_id)
+
     def send_rich_message(
         self,
         chat_id: int,
@@ -1362,7 +1566,12 @@ class TelegramClient:
         method: str,
         payload: dict[str, Any],
         uploads: dict[str, Path],
+        upload_roots: dict[str, Path] | None = None,
     ) -> dict[str, Any]:
+        if upload_roots:
+            return self._submit(
+                self._call_multipart_api(method, payload, uploads, upload_roots=upload_roots),
+            )
         return self._submit(self._call_multipart_api(method, payload, uploads))
 
     async def _call_api(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1422,6 +1631,7 @@ class TelegramClient:
         method: str,
         payload: dict[str, Any],
         uploads: dict[str, Path],
+        upload_roots: dict[str, Path] | None = None,
     ) -> dict[str, Any]:
         form_data = {
             key: json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list))
@@ -1433,7 +1643,15 @@ class TelegramClient:
         }
         for attempt in range(TELEGRAM_REQUEST_ATTEMPTS):
             try:
-                response = await self._post_multipart_api(method, form_data, uploads)
+                if upload_roots:
+                    response = await self._post_multipart_api(
+                        method,
+                        form_data,
+                        uploads,
+                        upload_roots=upload_roots,
+                    )
+                else:
+                    response = await self._post_multipart_api(method, form_data, uploads)
                 try:
                     result = response.json()
                 except ValueError as err:
@@ -1487,16 +1705,22 @@ class TelegramClient:
         method: str,
         form_data: dict[str, str],
         uploads: dict[str, Path],
+        upload_roots: dict[str, Path] | None = None,
     ) -> httpx.Response:
         with contextlib.ExitStack() as stack:
-            files = {
-                field_name: (
+            files = {}
+            for field_name, path in uploads.items():
+                upload_root = upload_roots.get(field_name) if upload_roots else None
+                source = (
+                    open_upload_file(path, upload_root)
+                    if upload_root is not None
+                    else path.open("rb")
+                )
+                files[field_name] = (
                     path.name,
-                    stack.enter_context(path.open("rb")),
+                    stack.enter_context(source),
                     mimetypes.guess_type(path.name)[0] or "application/octet-stream",
                 )
-                for field_name, path in uploads.items()
-            }
             async with httpx.AsyncClient(timeout=60) as client:
                 return await client.post(
                     f"{self.base_url}/{method}",
@@ -1919,10 +2143,14 @@ class CodexAppServerClient:
         config: Config,
         notification_handler: Callable[[dict[str, Any]], None] | None = None,
         server_request_handler: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        server_request_preparer: Callable[
+            [dict[str, Any]], tuple[dict[str, Any], Callable[[], None] | None]
+        ] | None = None,
     ) -> None:
         self.config = config
         self.notification_handler = notification_handler
         self.server_request_handler = server_request_handler
+        self.server_request_preparer = server_request_preparer
         self.connection: websocket.WebSocket | None = None
         self.reader_thread: threading.Thread | None = None
         self.lifecycle_lock = threading.RLock()
@@ -2585,7 +2813,9 @@ class CodexAppServerClient:
             return
 
         if request_id is not None and method:
-            if method == "item/tool/call" and self.server_request_handler:
+            if method == "item/tool/call" and (
+                self.server_request_handler or self.server_request_preparer
+            ):
                 request_thread = threading.Thread(
                     target=self._handle_server_request,
                     args=(request_id, message.get("params")),
@@ -2694,6 +2924,33 @@ class CodexAppServerClient:
                 )
             except Exception:
                 logger.exception("failed to decline invalid Codex dynamic tool call")
+            return
+
+        if params.get("tool") == TELEGRAM_FILE_TOOL_NAME and self.server_request_preparer:
+            try:
+                result, action = self.server_request_preparer(params)
+            except Exception as err:
+                logger.exception("failed to validate Telegram file upload")
+                result, action = dynamic_tool_result(False, safe_log_text(str(err))), None
+            turn_id = params.get("turnId")
+            if result.get("success") is True and isinstance(turn_id, str) and turn_id:
+                # A tool-only turn may complete as soon as the acknowledgement arrives.
+                with self.routing_lock:
+                    self.successful_dynamic_tool_turns.add(turn_id)
+            try:
+                self._write_started({"id": request_id, "result": result})
+            except Exception:
+                logger.exception("failed to acknowledge Telegram file upload")
+                if isinstance(action, DeferredTelegramAction):
+                    action.cancel()
+                return
+            if result.get("success") is not True:
+                return
+            if action is not None:
+                try:
+                    action()
+                except Exception:
+                    logger.exception("Telegram file upload failed after acknowledgement")
             return
 
         handler = self.server_request_handler
@@ -2917,8 +3174,39 @@ def telegram_sticker_tool_spec(
     }
 
 
+def telegram_file_tool_spec(
+    upload_dir: Path,
+    guest_mode: bool = False,
+) -> dict[str, Any]:
+    delivery = (
+        "Queue a file to attach to the final Telegram guest response. "
+        if guest_mode else "Send a file to the current Telegram chat and topic. "
+    )
+    return {
+        "type": "function",
+        "name": TELEGRAM_FILE_TOOL_NAME,
+        "description": (
+            delivery
+            + f"Only files inside {upload_dir} may be uploaded. "
+            "Relative paths are resolved against that directory. "
+            "The tool validates the request before returning; successful acceptance "
+            "does not confirm delivery, which happens asynchronously."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path of the file to upload."},
+                "caption": {"type": "string", "maxLength": 1024},
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    }
+
+
 def telegram_dynamic_tool_specs(
     sticker_names: tuple[str, ...] = (),
+    upload_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
     specs = [
         telegram_reaction_tool_spec(),
@@ -2926,6 +3214,8 @@ def telegram_dynamic_tool_specs(
     ]
     if sticker_names:
         specs.append(telegram_sticker_tool_spec(sticker_names))
+    if upload_dir is not None:
+        specs.append(telegram_file_tool_spec(upload_dir))
     return specs
 
 
@@ -3153,12 +3443,14 @@ class CodexRunner:
         self.config = config
         self.telegram = telegram
         self.telegram_stickers = configured_telegram_stickers(config.sticker_dir)
+        self.upload_dir = configured_upload_dir(config.upload_dir)
         self.sessions = SessionStore(config.session_store_path)
         self.git_puller = AsyncGitPuller(config)
         self.client = CodexAppServerClient(
             config,
             self._handle_app_server_notification,
             self._handle_dynamic_tool_call if telegram is not None else None,
+            server_request_preparer=self._prepare_file_upload if telegram is not None else None,
         )
         self.chat_locks: dict[ConversationKey, threading.RLock] = {}
         self.chat_locks_lock = threading.Lock()
@@ -3167,6 +3459,7 @@ class CodexRunner:
         self.active_turns: dict[ConversationKey, RunningCodexTurn] = {}
         self.guest_sticker_lock = threading.Lock()
         self.queued_guest_stickers: dict[str, list[QueuedTelegramSticker]] = {}
+        self.queued_guest_files: dict[str, list[QueuedTelegramFile]] = {}
         self.turn_steer_counts: dict[str, int] = {}
 
     def start(self) -> None:
@@ -3684,6 +3977,10 @@ class CodexRunner:
             self.turn_steer_counts.pop(turn_id, None)
         return stickers
 
+    def take_queued_guest_files(self, turn_id: str) -> tuple[QueuedTelegramFile, ...]:
+        with self.guest_sticker_lock:
+            return tuple(self.queued_guest_files.pop(turn_id, ()))
+
     def _handle_app_server_notification(self, message: dict[str, Any]) -> None:
         method = message.get("method")
         if method not in {"thread/archived", "thread/deleted"}:
@@ -3785,6 +4082,8 @@ class CodexRunner:
             return None
         if is_guest_conversation_key(chat_id):
             specs = [telegram_reaction_tool_spec(guest_mode=True)]
+            if self.upload_dir is not None:
+                specs.append(telegram_file_tool_spec(self.upload_dir, guest_mode=True))
             if self.telegram_stickers:
                 specs.append(
                     telegram_sticker_tool_spec(
@@ -3793,7 +4092,99 @@ class CodexRunner:
                     ),
                 )
             return specs
-        return telegram_dynamic_tool_specs(tuple(self.telegram_stickers))
+        return telegram_dynamic_tool_specs(tuple(self.telegram_stickers), self.upload_dir)
+
+    def _prepare_file_upload(
+        self,
+        params: dict[str, Any],
+    ) -> tuple[dict[str, Any], Callable[[], None] | None]:
+        def reject(message: str) -> tuple[dict[str, Any], None]:
+            return dynamic_tool_result(False, message), None
+
+        if self.upload_dir is None:
+            return reject("File uploads are disabled; CODEX_TELEGRAM_UPLOAD_DIR is not set.")
+        if params.get("tool") != TELEGRAM_FILE_TOOL_NAME or params.get("namespace") is not None:
+            return reject("Unsupported file upload tool.")
+        arguments = params.get("arguments")
+        if not isinstance(arguments, dict) or set(arguments) - {"path", "caption"}:
+            return reject("File upload arguments must contain only path and optional caption.")
+        path = arguments.get("path")
+        caption = arguments.get("caption")
+        if not isinstance(path, str) or not path.strip():
+            return reject("path must be a non-empty file path.")
+        if caption is not None and (not isinstance(caption, str) or len(caption) > 1024):
+            return reject("caption must be a string of at most 1024 characters.")
+        try:
+            file_path = validate_upload_file(Path(path), self.upload_dir)
+        except (OSError, ValueError, RuntimeError) as err:
+            return reject(str(err))
+        thread_id = params.get("threadId")
+        if not isinstance(thread_id, str) or not thread_id:
+            return reject("The file upload has no valid Codex thread ID.")
+        conversations = self.sessions.conversation_keys_for_session(thread_id)
+        if len(conversations) != 1:
+            return reject("The Codex thread is not mapped to exactly one Telegram conversation.")
+        if self.telegram is None:
+            return reject("Telegram file uploads are unavailable.")
+        conversation_key = conversations[0]
+        if is_guest_conversation_key(conversation_key):
+            if self.config.media_upload_chat_id is None:
+                return reject(
+                    "CODEX_TELEGRAM_MEDIA_UPLOAD_CHAT_ID is required for guest file uploads.",
+                )
+            turn_id = params.get("turnId")
+            with self._chat_lock(conversation_key):
+                running_turn = self.active_turns.get(conversation_key)
+                if (
+                    not isinstance(turn_id, str)
+                    or running_turn is None
+                    or running_turn.handle.turn_id != turn_id
+                ):
+                    return reject("The guest file upload does not belong to the active Codex turn.")
+                with self.guest_sticker_lock:
+                    files = self.queued_guest_files.setdefault(turn_id, [])
+                    if len(files) >= MAX_TELEGRAM_RICH_MEDIA:
+                        return reject("Too many files queued for this guest response.")
+                    queued_file = QueuedTelegramFile(file_path, caption, self.upload_dir)
+                    files.append(queued_file)
+
+            def cancel_queued_file() -> None:
+                with self.guest_sticker_lock:
+                    pending = self.queued_guest_files.get(turn_id, [])
+                    pending[:] = [entry for entry in pending if entry is not queued_file]
+                    if not pending:
+                        self.queued_guest_files.pop(turn_id, None)
+
+            return dynamic_tool_result(
+                True,
+                f"Queued {file_path.name!r} for the final guest response; delivery is pending.",
+            ), DeferredTelegramAction(lambda: None, cancel_queued_file)
+
+        active_turn = self.active_turns.get(conversation_key)
+        message_thread_id = (
+            active_turn.message_thread_id
+            if active_turn is not None
+            else conversation_message_thread_id(conversation_key)
+        )
+        chat_id = conversation_chat_id(conversation_key)
+
+        def upload() -> None:
+            self.send_optional_chat_action(conversation_key, "upload_document", message_thread_id)
+            sent_message_id = self.telegram.send_document(
+                chat_id,
+                file_path,
+                caption,
+                message_thread_id,
+                upload_dir=self.upload_dir,
+            )
+            if valid_telegram_message_id(sent_message_id):
+                self.record_bot_message(conversation_key, sent_message_id)
+            logger.info("sent Telegram file %s to chat %s", file_path.name, chat_id)
+
+        return dynamic_tool_result(
+            True,
+            f"Accepted {file_path.name!r} for asynchronous upload; delivery is pending.",
+        ), upload
 
     def _handle_dynamic_tool_call(self, params: dict[str, Any]) -> dict[str, Any]:
         thread_id = params.get("threadId")
@@ -4711,10 +5102,15 @@ class ConversationController:
         queued_stickers = self.bot.codex.take_queued_guest_stickers(
             running_turn.handle.turn_id,
         )
+        queued_files = (
+            tuple(self.bot.codex.take_queued_guest_files(running_turn.handle.turn_id))
+            if self.bot.config.upload_dir is not None else ()
+        )
         self._deliver_final(
             response,
             codex_succeeded=error is None,
             queued_stickers=queued_stickers,
+            queued_files=queued_files,
         )
         self._finish_target()
         for message, clear_attachments in self.deferred_attachment_cleanup:
@@ -4816,6 +5212,7 @@ class ConversationController:
         response: str,
         codex_succeeded: bool,
         queued_stickers: tuple[QueuedTelegramSticker, ...] = (),
+        queued_files: tuple[QueuedTelegramFile, ...] = (),
     ) -> None:
         target = self.target
         if target is None:
@@ -4825,6 +5222,7 @@ class ConversationController:
                 target,
                 response,
                 queued_stickers,
+                queued_files,
             )
             return
         if codex_succeeded and not response.strip():
@@ -4855,6 +5253,7 @@ class ConversationController:
         target: TelegramResponseTarget,
         response: str,
         queued_stickers: tuple[QueuedTelegramSticker, ...],
+        queued_files: tuple[QueuedTelegramFile, ...] = (),
     ) -> None:
         if target.response_sent:
             if target.consumed_reason == "deadline":
@@ -4869,7 +5268,7 @@ class ConversationController:
             )
             return
 
-        if len(queued_stickers) == 1 and not response.strip():
+        if len(queued_stickers) == 1 and not response.strip() and not queued_files:
             delivery = self.bot.answer_guest_sticker_response(
                 target.message["guest_query_id"],
                 queued_stickers[0].path,
@@ -4883,6 +5282,7 @@ class ConversationController:
         original_target = self.original_guest_target
         split_sticker_delivery = (
             len(queued_stickers) == 1
+            and not queued_files
             and bool(response.strip())
             and self.guest_steer_count == 1
             and queued_stickers[0].steer_count == 0
@@ -4908,12 +5308,14 @@ class ConversationController:
             *self.generated_image_paths,
             *(sticker.path.resolve() for sticker in queued_stickers),
         }
+        file_arguments = {"queued_files": queued_files} if queued_files else {}
         delivery = self.bot.answer_guest_response(
             target.message["guest_query_id"],
             response,
             target.message,
             "response",
             frozenset(generated_image_paths),
+            **file_arguments,
         )
         if delivery.error is not None:
             self.bot.codex.record_response_error(
@@ -5661,12 +6063,20 @@ class Bot:
         message: dict[str, Any],
         response_kind: str,
         generated_image_paths: frozenset[Path] = frozenset(),
+        queued_files: tuple[QueuedTelegramFile, ...] = (),
     ) -> GuestResponseDelivery:
         chat_id = message.get("chat", {}).get("id")
         message_id = message.get("message_id")
         rich_error: Exception | None = None
         try:
-            if generated_image_paths:
+            if queued_files:
+                self.telegram.answer_guest_query(
+                    guest_query_id,
+                    response,
+                    generated_image_paths,
+                    queued_files=queued_files,
+                )
+            elif generated_image_paths:
                 self.telegram.answer_guest_query(
                     guest_query_id,
                     response,
@@ -5938,6 +6348,15 @@ def telegram_sticker_file_id(response: dict[str, Any]) -> str:
     file_id = sticker.get("file_id") if isinstance(sticker, dict) else None
     if not isinstance(file_id, str) or not file_id:
         raise RuntimeError("Telegram sendSticker returned no reusable file ID")
+    return file_id
+
+
+def telegram_document_file_id(response: dict[str, Any]) -> str:
+    message = response.get("result")
+    document = message.get("document") if isinstance(message, dict) else None
+    file_id = document.get("file_id") if isinstance(document, dict) else None
+    if not isinstance(file_id, str) or not file_id:
+        raise RuntimeError("Telegram sendDocument returned no reusable file ID")
     return file_id
 
 

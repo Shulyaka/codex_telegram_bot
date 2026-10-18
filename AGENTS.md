@@ -51,12 +51,17 @@ Optional environment variables:
 - `CODEX_TELEGRAM_MAINTENANCE_TIMEOUT_SECONDS` - timeout for each Codex app-server maintenance operation; defaults to `600`.
 - `CODEX_TELEGRAM_GUEST_WARNING_SECONDS` - when to use a still-working warning as the single guest response;
   defaults to `290` (4 minutes 50 seconds).
-- `CODEX_TELEGRAM_MEDIA_UPLOAD_CHAT_ID` - private channel or chat used to pre-upload images referenced by
+- `CODEX_TELEGRAM_MEDIA_UPLOAD_CHAT_ID` - private channel or chat used to pre-upload images and documents referenced by
   guest responses, which can only use existing Telegram file IDs. The bot must be able to post there.
 - `CODEX_TELEGRAM_STICKER_DIR` - directory containing static `.webp` stickers. Relative paths are resolved
   against `CODEX_TELEGRAM_REPO_DIR`. When the directory exists and contains stickers, all threads get a
   `send_sticker` dynamic tool whose choices are the filenames without `.webp`; restart the bot after changing
   the directory contents.
+- `CODEX_TELEGRAM_UPLOAD_DIR` - optional existing directory of files the bot may send through the `send_file`
+  dynamic tool. Unset or empty disables the tool. Paths expand `~`; relative paths are resolved against
+  `CODEX_TELEGRAM_REPO_DIR`, and absolute paths may point outside the repository. A configured path that is
+  missing or is not a directory is a startup error. Only existing non-empty regular files whose resolved paths remain
+  inside this directory can be sent, up to 50 MiB per file. Symlinks and `..` paths cannot escape the directory.
 - `CODEX_TELEGRAM_POLL_TIMEOUT_SECONDS` - Telegram long-poll timeout; defaults to `30`.
 - `CODEX_TELEGRAM_CHAT_ACTION_INTERVAL_SECONDS` - `sendChatAction` interval; defaults to `5`.
 - `CODEX_TELEGRAM_MAX_CONCURRENT_CHATS` - size of each worker pool used for chat-event processing and
@@ -105,7 +110,8 @@ grant access.
 For each accepted text message, caption, image, or other file attachment, it keeps sending Telegram's `typing` chat action while
 the Codex turn is running.
 Ordinary turns additionally send a single `choose_sticker` action when the `send_sticker` dynamic tool is
-called and a single `upload_photo` action when an app-server image-generation item starts. These one-shot
+called, a single `upload_document` action when an accepted `send_file` upload runs, and a single
+`upload_photo` action when an app-server image-generation item starts. These one-shot
 actions are best-effort and use the originating Telegram topic. Guest queries do not send chat actions.
 Telegram long polling and Bot API requests use separate asynchronous HTTP clients. Updates are routed to an
 ordered controller for their `(chat_id, message_thread_id)`: different chats and forum topics can run
@@ -168,9 +174,20 @@ response. With one steer, a sticker queued before the steer may consume the stil
 original guest query while the textual result answers the steering message. Telegram photo and sticker file
 IDs are cached separately in memory by source/content, so repeated guest images and repeated stickers avoid
 another temporary upload for the lifetime of the bot process.
+When `CODEX_TELEGRAM_UPLOAD_DIR` is configured, ordinary and guest threads additionally register `send_file`
+with a required `path` and optional `caption`. Relative file paths use the upload directory. The bot chooses
+the destination chat from the Codex thread and keeps ordinary documents in the originating forum topic.
+Captions are limited to 1024 characters. Guest files are queued for the query's single rich response together
+with its text, images, and stickers, and require `CODEX_TELEGRAM_MEDIA_UPLOAD_CHAT_ID` for pre-uploading
+reusable Telegram document IDs. Steering keeps files queued until the newest guest query's final response.
+If a deadline warning has already consumed that response, queued files are drained without uploading.
 Dynamic tool calls are acknowledged successfully before their Telegram actions run. This lets the local bot
 win the app-server response race against other subscribed clients; execution then continues in the request's
 background thread. A later action failure is logged but cannot change the already-returned tool result.
+File-upload calls validate their arguments, paths, and conversation mapping before acknowledgement, so an
+invalid request returns a failed tool result without uploading. Guest files are queued before acknowledgement
+so an immediately completed turn can include them in its response.
+Successful file-tool results confirm acceptance; actual Telegram delivery follows asynchronously.
 On startup the bot resumes stored non-archived group and supergroup threads (negative Telegram chat IDs)
 and keeps those subscriptions for the lifetime of the connection. Private-chat threads are resumed on
 demand and unsubscribed after each turn or scheduled maintenance operation. Their stored session mapping

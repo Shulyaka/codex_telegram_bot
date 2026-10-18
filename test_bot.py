@@ -26,6 +26,7 @@ from bot import (  # noqa: E402
     GUEST_DEADLINE_RESPONSE_ERROR,
     GUEST_RESPONSE_WARNING_MESSAGE,
     TELEGRAM_CLEAR_REACTION_TOOL_NAME,
+    TELEGRAM_FILE_TOOL_NAME,
     TELEGRAM_REACTION_EMOJIS,
     TELEGRAM_REACTION_TOOL_NAME,
     TELEGRAM_STICKER_TOOL_NAME,
@@ -44,6 +45,7 @@ from bot import (  # noqa: E402
     GitPullError,
     GuestResponseDelivery,
     QueuedTelegramSticker,
+    QueuedTelegramFile,
     RunningCodexTurn,
     SessionRecord,
     SessionStore,
@@ -74,6 +76,7 @@ from bot import (  # noqa: E402
     telegram_conversation_key,
     telegram_clear_reaction_tool_spec,
     telegram_dynamic_tool_specs,
+    telegram_file_tool_spec,
     telegram_reaction_tool_spec,
     telegram_sticker_tool_spec,
     telegram_thread_name,
@@ -177,6 +180,65 @@ class ConfigurationTest(unittest.TestCase):
                         config = Config.from_env()
 
                         self.assertEqual(config.instructions_file, expected.resolve())
+
+    def test_upload_directory_is_optional(self) -> None:
+        for value in (None, ""):
+            with self.subTest(value=value):
+                environment = {
+                    "TELEGRAM_BOT_TOKEN": "test-token",
+                    "TELEGRAM_ALLOWED_CHAT_IDS": "-1001",
+                }
+                if value is not None:
+                    environment["CODEX_TELEGRAM_UPLOAD_DIR"] = value
+                with patch.dict(os.environ, environment, clear=True):
+                    config = Config.from_env()
+
+                self.assertIsNone(config.upload_dir)
+
+    def test_upload_directory_resolves_relative_absolute_and_home_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            repo_dir = root / "repo"
+            repo_dir.mkdir()
+            (repo_dir / "uploads").mkdir()
+            outside_dir = root / "shared-uploads"
+            outside_dir.mkdir()
+            environment = {
+                "TELEGRAM_BOT_TOKEN": "test-token",
+                "TELEGRAM_ALLOWED_CHAT_IDS": "-1001",
+                "CODEX_TELEGRAM_REPO_DIR": str(repo_dir),
+            }
+            with patch.dict(os.environ, environment, clear=True):
+                for value, expected in (
+                    ("uploads", repo_dir / "uploads"),
+                    (str(outside_dir), outside_dir),
+                    ("~", Path.home()),
+                ):
+                    with self.subTest(value=value):
+                        os.environ["CODEX_TELEGRAM_UPLOAD_DIR"] = value
+
+                        config = Config.from_env()
+
+                        self.assertEqual(config.upload_dir, expected.resolve())
+
+    def test_upload_directory_must_exist_and_be_a_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            regular_file = root / "file.txt"
+            regular_file.write_text("not a directory", encoding="utf-8")
+            for upload_dir in (root / "missing", regular_file):
+                with self.subTest(upload_dir=upload_dir):
+                    environment = {
+                        "TELEGRAM_BOT_TOKEN": "test-token",
+                        "TELEGRAM_ALLOWED_CHAT_IDS": "-1001",
+                        "CODEX_TELEGRAM_UPLOAD_DIR": str(upload_dir),
+                    }
+                    with patch.dict(os.environ, environment, clear=True):
+                        with self.assertRaisesRegex(ValueError, "CODEX_TELEGRAM_UPLOAD_DIR"):
+                            Config.from_env()
+
+                    with self.assertRaisesRegex(ValueError, "CODEX_TELEGRAM_UPLOAD_DIR"):
+                        CodexRunner(build_config(root, upload_dir=upload_dir), MagicMock())
 
     def test_read_only_defaults_to_true(self) -> None:
         environment = {
@@ -2248,6 +2310,377 @@ class TelegramThreadNameTest(unittest.TestCase):
         )
 
 
+class FileUploadToolTest(unittest.TestCase):
+    def setUp(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.root = Path(temp_dir.name).resolve()
+        self.upload_dir = self.root / "uploads"
+        self.upload_dir.mkdir()
+        self.document = self.upload_dir / "report.txt"
+        self.document.write_text("Generated report", encoding="utf-8")
+        self.telegram = MagicMock()
+        self.telegram.send_document.return_value = 3001
+        self.runner = CodexRunner(
+            build_config(self.root, upload_dir=self.upload_dir),
+            self.telegram,
+        )
+        self.runner.sessions.set(-1001, "thread-one")
+        self.runner.active_turns[-1001] = RunningCodexTurn(
+            -1001,
+            "thread-one",
+            CodexTurnHandle("thread-one", "turn-one", queue.Queue()),
+        )
+
+    def params(self, arguments: object, **overrides: object) -> dict[str, object]:
+        params = {
+            "threadId": "thread-one",
+            "turnId": "turn-one",
+            "callId": "file-call",
+            "tool": TELEGRAM_FILE_TOOL_NAME,
+            "namespace": None,
+            "arguments": arguments,
+        }
+        params.update(overrides)
+        return params
+
+    def guest_runner(self, *, media_upload_chat_id: int | None = -10099) -> CodexRunner:
+        runner = CodexRunner(
+            build_config(
+                self.root,
+                upload_dir=self.upload_dir,
+                media_upload_chat_id=media_upload_chat_id,
+            ),
+            self.telegram,
+        )
+        runner.sessions.remove(-1001, "thread-one")
+        guest_key = guest_conversation_key(-1001)
+        runner.sessions.set(guest_key, "thread-one")
+        runner.active_turns[guest_key] = RunningCodexTurn(
+            guest_key,
+            "thread-one",
+            CodexTurnHandle("thread-one", "turn-one", queue.Queue()),
+        )
+        runner.turn_steer_counts["turn-one"] = 0
+        return runner
+
+    def test_file_tool_is_opt_in_for_ordinary_and_guest_threads(self) -> None:
+        disabled_runner = CodexRunner(build_config(self.root), self.telegram)
+        for conversation_key in (-1001, guest_conversation_key(-1001)):
+            with self.subTest(conversation_key=conversation_key):
+                disabled_specs = disabled_runner._dynamic_tools_for_chat(conversation_key)
+                self.assertNotIn(
+                    TELEGRAM_FILE_TOOL_NAME,
+                    [spec["name"] for spec in disabled_specs],
+                )
+                enabled_specs = self.runner._dynamic_tools_for_chat(conversation_key)
+                self.assertEqual(
+                    sum(spec["name"] == TELEGRAM_FILE_TOOL_NAME for spec in enabled_specs),
+                    1,
+                )
+
+        result, action = disabled_runner._prepare_file_upload(
+            self.params({"path": str(self.document)}),
+        )
+        self.assertFalse(result["success"])
+        self.assertIsNone(action)
+        self.telegram.send_document.assert_not_called()
+
+    def test_file_tool_schema_exposes_path_and_optional_caption(self) -> None:
+        for guest_mode in (False, True):
+            with self.subTest(guest_mode=guest_mode):
+                spec = telegram_file_tool_spec(self.upload_dir, guest_mode=guest_mode)
+                schema = spec["inputSchema"]
+
+                self.assertEqual(spec["name"], TELEGRAM_FILE_TOOL_NAME)
+                self.assertEqual(schema["required"], ["path"])
+                self.assertEqual(schema["properties"]["path"]["type"], "string")
+                self.assertEqual(schema["properties"]["caption"]["type"], "string")
+                self.assertEqual(schema["properties"]["caption"]["maxLength"], 1024)
+                self.assertEqual(set(schema["properties"]), {"path", "caption"})
+                self.assertFalse(schema["additionalProperties"])
+                self.assertIn(str(self.upload_dir), json.dumps(spec))
+
+    def test_ordinary_file_is_sent_only_when_prepared_action_runs(self) -> None:
+        for path in ("report.txt", str(self.document)):
+            with self.subTest(path=path):
+                self.telegram.reset_mock()
+                result, action = self.runner._prepare_file_upload(
+                    self.params({"path": path, "caption": "Monthly report"}),
+                )
+
+                self.assertTrue(result["success"])
+                self.assertTrue(callable(action))
+                self.telegram.send_document.assert_not_called()
+                action()
+
+                self.telegram.send_document.assert_called_once_with(
+                    -1001,
+                    self.document,
+                    "Monthly report",
+                    None,
+                    upload_dir=self.upload_dir,
+                )
+                self.assertEqual(self.runner.sessions.get_record(-1001).last_bot_message_id, 3001)
+
+    def test_file_uses_the_current_forum_topic(self) -> None:
+        topic_key = telegram_conversation_key("message", -1001, 42)
+        self.runner.sessions.remove(-1001, "thread-one")
+        self.runner.sessions.set(topic_key, "thread-one")
+        self.runner.active_turns[topic_key] = RunningCodexTurn(
+            topic_key,
+            "thread-one",
+            CodexTurnHandle("thread-one", "turn-one", queue.Queue()),
+            42,
+        )
+
+        result, action = self.runner._prepare_file_upload(self.params({"path": "report.txt"}))
+
+        self.assertTrue(result["success"])
+        action()
+        self.telegram.send_document.assert_called_once_with(
+            -1001,
+            self.document,
+            None,
+            42,
+            upload_dir=self.upload_dir,
+        )
+
+    def test_file_paths_reject_missing_nonregular_and_escaped_targets(self) -> None:
+        outside_file = self.root / "outside.txt"
+        outside_file.write_text("outside", encoding="utf-8")
+        sibling_dir = self.root / "uploads-sibling"
+        sibling_dir.mkdir()
+        sibling_file = sibling_dir / "report.txt"
+        sibling_file.write_text("sibling", encoding="utf-8")
+        escaped_link = self.upload_dir / "outside-link"
+        escaped_link.symlink_to(outside_file)
+        escaped_directory = self.upload_dir / "outside-directory"
+        escaped_directory.symlink_to(sibling_dir, target_is_directory=True)
+        invalid_paths = [
+            "missing.txt",
+            ".",
+            "../outside.txt",
+            str(outside_file),
+            str(sibling_file),
+            "outside-link",
+            "outside-directory/report.txt",
+            "bad\x00path",
+        ]
+        if hasattr(os, "mkfifo"):
+            os.mkfifo(self.upload_dir / "pipe")
+            invalid_paths.append("pipe")
+
+        for path in invalid_paths:
+            with self.subTest(path=path):
+                result, action = self.runner._prepare_file_upload(self.params({"path": path}))
+
+                self.assertFalse(result["success"])
+                self.assertIsNone(action)
+
+        self.telegram.send_document.assert_not_called()
+
+    def test_symlink_to_regular_file_inside_upload_directory_is_allowed(self) -> None:
+        (self.upload_dir / "report-link.txt").symlink_to(self.document)
+
+        result, action = self.runner._prepare_file_upload(
+            self.params({"path": "report-link.txt"}),
+        )
+
+        self.assertTrue(result["success"])
+        action()
+        self.assertEqual(self.telegram.send_document.call_args.args[1], self.document)
+
+    def test_file_limit_accepts_50_mib_and_rejects_larger_files(self) -> None:
+        for size, accepted in ((50 * 1024 * 1024, True), (50 * 1024 * 1024 + 1, False)):
+            with self.subTest(size=size):
+                with self.document.open("wb") as output:
+                    output.truncate(size)
+
+                result, action = self.runner._prepare_file_upload(self.params({"path": "report.txt"}))
+
+                self.assertIs(result["success"], accepted)
+                self.assertEqual(callable(action), accepted)
+
+        self.telegram.send_document.assert_not_called()
+
+    def test_file_arguments_and_chat_mapping_are_validated(self) -> None:
+        for arguments in (
+            None,
+            [],
+            {},
+            {"path": None},
+            {"path": ""},
+            {"path": 1},
+            {"path": "report.txt", "caption": 1},
+            {"path": "report.txt", "chat_id": -1002},
+        ):
+            with self.subTest(arguments=arguments):
+                result, action = self.runner._prepare_file_upload(self.params(arguments))
+                self.assertFalse(result["success"])
+                self.assertIsNone(action)
+
+        for overrides in ({"threadId": None}, {"threadId": "unknown-thread"}, {"namespace": "other"}):
+            with self.subTest(overrides=overrides):
+                result, action = self.runner._prepare_file_upload(
+                    self.params({"path": "report.txt"}, **overrides),
+                )
+                self.assertFalse(result["success"])
+                self.assertIsNone(action)
+
+        self.runner.sessions.set(-1002, "thread-one")
+        result, action = self.runner._prepare_file_upload(self.params({"path": "report.txt"}))
+        self.assertFalse(result["success"])
+        self.assertIsNone(action)
+        self.telegram.send_document.assert_not_called()
+
+    def test_file_caption_limit_is_validated_before_upload(self) -> None:
+        for length, accepted in ((1024, True), (1025, False)):
+            with self.subTest(length=length):
+                result, action = self.runner._prepare_file_upload(
+                    self.params({"path": "report.txt", "caption": "x" * length}),
+                )
+
+                self.assertIs(result["success"], accepted)
+                self.assertEqual(callable(action), accepted)
+
+        self.telegram.send_document.assert_not_called()
+
+    def test_accepted_file_is_acknowledged_before_telegram_upload(self) -> None:
+        events: list[str] = []
+        client = self.runner.client
+
+        def acknowledge(message: dict[str, object]) -> None:
+            self.assertTrue(message["result"]["success"])
+            self.assertIn("turn-one", client.successful_dynamic_tool_turns)
+            events.append("ack")
+
+        def upload(*args: object, **kwargs: object) -> int:
+            events.append("upload")
+            return 3001
+
+        client._write_started = MagicMock(side_effect=acknowledge)
+        self.telegram.send_document.side_effect = upload
+
+        client._handle_server_request(17, self.params({"path": "report.txt"}))
+
+        self.assertEqual(events, ["ack", "upload"])
+        client._write_started.assert_called_once()
+
+    def test_invalid_file_is_rejected_before_successful_acknowledgement(self) -> None:
+        client = self.runner.client
+        client._write_started = MagicMock()
+
+        client._handle_server_request(17, self.params({"path": "missing.txt"}))
+
+        client._write_started.assert_called_once()
+        self.assertFalse(client._write_started.call_args.args[0]["result"]["success"])
+        self.assertNotIn("turn-one", client.successful_dynamic_tool_turns)
+        self.telegram.send_document.assert_not_called()
+
+    def test_failed_file_acknowledgement_prevents_upload(self) -> None:
+        client = self.runner.client
+        client._write_started = MagicMock(side_effect=CodexAppServerError("socket closed"))
+
+        with self.assertLogs("bot", level="ERROR"):
+            client._handle_server_request(17, self.params({"path": "report.txt"}))
+
+        client._write_started.assert_called_once()
+        self.assertTrue(client._write_started.call_args.args[0]["result"]["success"])
+        self.telegram.send_document.assert_not_called()
+
+    def test_guest_file_is_queued_before_acknowledgement_without_telegram_io(self) -> None:
+        runner = self.guest_runner()
+        observed_queue: list[tuple[QueuedTelegramFile, ...]] = []
+
+        def acknowledge(message: dict[str, object]) -> None:
+            self.assertTrue(message["result"]["success"])
+            self.assertIn("turn-one", runner.client.successful_dynamic_tool_turns)
+            observed_queue.append(runner.take_queued_guest_files("turn-one"))
+
+        runner.client._write_started = MagicMock(side_effect=acknowledge)
+
+        runner.client._handle_server_request(
+            17,
+            self.params({"path": "report.txt", "caption": "Guest report"}),
+        )
+
+        self.assertEqual(
+            observed_queue,
+            [(QueuedTelegramFile(self.document, "Guest report", self.upload_dir),)],
+        )
+        self.assertEqual(runner.take_queued_guest_files("turn-one"), ())
+        self.telegram.send_document.assert_not_called()
+        self.telegram.answer_guest_query.assert_not_called()
+
+    def test_prepared_guest_action_keeps_file_queued_without_telegram_io(self) -> None:
+        runner = self.guest_runner()
+
+        result, action = runner._prepare_file_upload(self.params({"path": "report.txt"}))
+
+        self.assertTrue(result["success"])
+        self.assertTrue(callable(action))
+        action()
+        self.assertEqual(
+            runner.take_queued_guest_files("turn-one"),
+            (QueuedTelegramFile(self.document, None, self.upload_dir),),
+        )
+        self.telegram.send_document.assert_not_called()
+        self.telegram.answer_guest_query.assert_not_called()
+
+    def test_failed_guest_file_acknowledgement_rolls_back_only_that_file(self) -> None:
+        for already_accepted in (False, True):
+            with self.subTest(already_accepted=already_accepted):
+                runner = self.guest_runner()
+                client = runner.client
+                client._write_started = MagicMock()
+                accepted_file = None
+                if already_accepted:
+                    client._handle_server_request(16, self.params({"path": "report.txt"}))
+                    accepted_file = runner.queued_guest_files["turn-one"][0]
+                client._write_started = MagicMock(
+                    side_effect=CodexAppServerError("socket closed"),
+                )
+
+                with self.assertLogs("bot", level="ERROR"):
+                    client._handle_server_request(17, self.params({"path": "report.txt"}))
+
+                pending = runner.take_queued_guest_files("turn-one")
+                if already_accepted:
+                    self.assertEqual(len(pending), 1)
+                    self.assertIs(pending[0], accepted_file)
+                else:
+                    self.assertEqual(pending, ())
+                client._write_started.assert_called_once()
+
+        self.telegram.send_document.assert_not_called()
+        self.telegram.answer_guest_query.assert_not_called()
+
+    def test_guest_file_requires_active_matching_turn_and_media_upload_chat(self) -> None:
+        for condition in ("missing-turn", "wrong-turn", "inactive-turn", "missing-media-chat"):
+            with self.subTest(condition=condition):
+                runner = self.guest_runner(
+                    media_upload_chat_id=None if condition == "missing-media-chat" else -10099,
+                )
+                overrides = {}
+                if condition == "missing-turn":
+                    overrides["turnId"] = None
+                elif condition == "wrong-turn":
+                    overrides["turnId"] = "other-turn"
+                elif condition == "inactive-turn":
+                    runner.active_turns.clear()
+
+                result, action = runner._prepare_file_upload(
+                    self.params({"path": "report.txt"}, **overrides),
+                )
+
+                self.assertFalse(result["success"])
+                self.assertIsNone(action)
+                self.assertEqual(runner.take_queued_guest_files("turn-one"), ())
+
+        self.telegram.send_document.assert_not_called()
+
+
 class CodexRunnerTest(unittest.TestCase):
     def test_latest_bot_message_maps_reaction_back_to_forum_conversation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3276,6 +3709,7 @@ class ConversationControllerTest(unittest.TestCase):
         bot.codex = MagicMock()
         bot.codex.previous_response_error.return_value = None
         bot.codex.take_queued_guest_stickers.return_value = ()
+        bot.codex.take_queued_guest_files.return_value = ()
         bot.download_images = MagicMock(return_value=[])
         bot.download_files = MagicMock(return_value=[])
         bot.send_message_response = MagicMock(return_value=3001)
@@ -3705,6 +4139,153 @@ class ConversationControllerTest(unittest.TestCase):
             bot.send_message_response.assert_not_called()
             self.assertIsNone(controller.active_turn)
             controller.shutdown()
+
+    def test_guest_file_only_final_reaches_telegram_without_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bot, running_turn = self.build_bot(root)
+            bot.config = build_config(root, upload_dir=root)
+            files = (QueuedTelegramFile(root / "report.txt", "Report", root),)
+            bot.codex.take_queued_guest_files.return_value = files
+            bot.answer_guest_response = MagicMock(
+                wraps=Bot.answer_guest_response.__get__(bot, Bot),
+            )
+            controller = ConversationController(bot, -1001, guest_conversation_key(-1001))
+            self.addCleanup(controller.shutdown)
+            message = {
+                "message_id": 1,
+                "guest_query_id": "guest-one",
+                "text": "send the report",
+                "date": time.time(),
+                "chat": {"id": -1001, "type": "supergroup"},
+            }
+            controller._process_incoming("guest_message", message)
+
+            controller._process_turn_completed(running_turn, "", None)
+
+            bot.codex.take_queued_guest_files.assert_called_once_with("turn-one")
+            bot.telegram.answer_guest_query.assert_called_once_with(
+                "guest-one",
+                "",
+                frozenset(),
+                queued_files=files,
+            )
+            bot.answer_guest_sticker_response.assert_not_called()
+            self.assertIsNone(controller.active_turn)
+
+    def test_guest_text_files_and_sticker_share_the_newest_query_response(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            bot, running_turn = self.build_bot(root)
+            bot.config = build_config(root, upload_dir=root)
+            files = (QueuedTelegramFile(root / "report.txt", None, root),)
+            sticker = QueuedTelegramSticker("happy", root / "happy.webp", 0)
+            bot.codex.take_queued_guest_files.return_value = files
+            bot.codex.take_queued_guest_stickers.return_value = (sticker,)
+            bot.answer_guest_response = MagicMock(
+                wraps=Bot.answer_guest_response.__get__(bot, Bot),
+            )
+            controller = ConversationController(bot, -1001, guest_conversation_key(-1001))
+            self.addCleanup(controller.shutdown)
+            for message_id in (1, 2):
+                controller._process_incoming(
+                    "guest_message",
+                    {
+                        "message_id": message_id,
+                        "guest_query_id": f"guest-{message_id}",
+                        "text": f"request {message_id}",
+                        "date": time.time(),
+                        "chat": {"id": -1001, "type": "supergroup"},
+                    },
+                )
+
+            controller._process_turn_completed(running_turn, "Report ready.", None)
+
+            bot.telegram.answer_guest_query.assert_called_once()
+            args = bot.telegram.answer_guest_query.call_args.args
+            self.assertEqual(args[0], "guest-2")
+            self.assertIn("Report ready.", args[1])
+            self.assertIn(sticker.path.as_uri(), args[1])
+            self.assertEqual(args[2], frozenset({sticker.path}))
+            self.assertEqual(
+                bot.telegram.answer_guest_query.call_args.kwargs,
+                {"queued_files": files},
+            )
+            bot.answer_guest_sticker_response.assert_not_called()
+
+    def test_guest_files_remain_queued_across_steering_until_final_response(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bot, running_turn = self.build_bot(root)
+            bot.config = build_config(root, upload_dir=root)
+            files = (QueuedTelegramFile(root / "report.txt", None, root),)
+            bot.codex.take_queued_guest_files.return_value = files
+            bot.answer_guest_response = MagicMock(
+                wraps=Bot.answer_guest_response.__get__(bot, Bot),
+            )
+            controller = ConversationController(bot, -1001, guest_conversation_key(-1001))
+            self.addCleanup(controller.shutdown)
+            for message_id in (1, 2, 3):
+                controller._process_incoming(
+                    "guest_message",
+                    {
+                        "message_id": message_id,
+                        "guest_query_id": f"guest-{message_id}",
+                        "text": f"request {message_id}",
+                        "date": time.time(),
+                        "chat": {"id": -1001, "type": "supergroup"},
+                    },
+                )
+
+            bot.codex.take_queued_guest_files.assert_not_called()
+            bot.telegram.answer_guest_query.assert_not_called()
+
+            controller._process_turn_completed(running_turn, "Done.", None)
+
+            self.assertEqual(bot.codex.steer_turn.call_count, 2)
+            bot.codex.take_queued_guest_files.assert_called_once_with("turn-one")
+            bot.telegram.answer_guest_query.assert_called_once_with(
+                "guest-3",
+                "Done.",
+                frozenset(),
+                queued_files=files,
+            )
+
+    def test_deadline_consumed_guest_response_drains_files_without_sending_them(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bot, running_turn = self.build_bot(root)
+            bot.config = build_config(root, upload_dir=root)
+            bot.codex.take_queued_guest_files.return_value = (
+                QueuedTelegramFile(root / "report.txt", None, root),
+            )
+            bot.answer_guest_response = MagicMock(
+                wraps=Bot.answer_guest_response.__get__(bot, Bot),
+            )
+            controller = ConversationController(bot, -1001, guest_conversation_key(-1001))
+            self.addCleanup(controller.shutdown)
+            message = {
+                "message_id": 1,
+                "guest_query_id": "guest-one",
+                "text": "prepare the report",
+                "date": time.time(),
+                "chat": {"id": -1001, "type": "supergroup"},
+            }
+            controller._process_incoming("guest_message", message)
+            controller._process_guest_deadline(controller.target.generation)
+
+            controller._process_turn_completed(running_turn, "Done.", None)
+
+            bot.codex.take_queued_guest_files.assert_called_once_with("turn-one")
+            bot.telegram.answer_guest_query.assert_called_once_with(
+                "guest-one",
+                GUEST_RESPONSE_WARNING_MESSAGE,
+            )
+            bot.codex.record_response_error.assert_called_once_with(
+                guest_conversation_key(-1001),
+                GUEST_DEADLINE_RESPONSE_ERROR,
+            )
+            bot.answer_guest_sticker_response.assert_not_called()
 
     def test_guest_turn_with_only_one_sticker_answers_with_sticker(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4436,9 +5017,11 @@ class CodexProgressLoggingTest(unittest.TestCase):
             return {"success": True, "contentItems": []}
 
         handler = MagicMock(side_effect=execute_action)
+        preparer = MagicMock(side_effect=AssertionError("Only file uploads need preparation"))
         client = CodexAppServerClient(
             build_config(Path("/repo")),
             server_request_handler=handler,
+            server_request_preparer=preparer,
         )
 
         def send_response(message: dict[str, object]) -> None:
@@ -4461,6 +5044,7 @@ class CodexProgressLoggingTest(unittest.TestCase):
         self.assertTrue(action_completed.wait(1))
         self.assertEqual(execution_order, ["response", "action"])
         handler.assert_called_once_with(params)
+        preparer.assert_not_called()
         client._write_started.assert_called_once_with(
             {
                 "id": 17,
@@ -5418,6 +6002,8 @@ def build_config(
     sticker_dir: Path | None = None,
     read_only: bool = True,
     instructions_file: Path | None = None,
+    upload_dir: Path | None = None,
+    media_upload_chat_id: int | None = None,
 ) -> Config:
     return Config(
         telegram_bot_token="test-token",
@@ -5441,6 +6027,8 @@ def build_config(
         sticker_dir=sticker_dir,
         read_only=read_only,
         instructions_file=instructions_file,
+        upload_dir=upload_dir,
+        media_upload_chat_id=media_upload_chat_id,
     )
 
 
