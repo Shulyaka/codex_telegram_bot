@@ -22,7 +22,6 @@ from bot import (  # noqa: E402
     ATTACHMENT_CACHE_DIRECTORY,
     ATTACHMENT_FREE_MESSAGE_RETENTION,
     DEFAULT_ATTACHMENT_RETENTION_SECONDS,
-    GIT_PULL_WARNING_MESSAGE,
     GUEST_DEADLINE_RESPONSE_ERROR,
     GUEST_RESPONSE_WARNING_MESSAGE,
     TELEGRAM_CLEAR_REACTION_TOOL_NAME,
@@ -3638,10 +3637,10 @@ class CodexRunnerTest(unittest.TestCase):
             runner.client.compact_thread.assert_called_once_with("private-session")
             runner.client.unsubscribe_thread.assert_called_once_with("private-session")
 
-    def test_git_pull_failure_warns_and_continues_with_codex(self) -> None:
+    def test_git_pull_failure_is_logged_without_emitting_agent_messages(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = build_config(Path(temp_dir))
-            warnings: list[str] = []
+            agent_messages: list[str] = []
 
             with (
                 patch(
@@ -3658,12 +3657,12 @@ class CodexRunnerTest(unittest.TestCase):
                 response = runner.run(
                     -1001,
                     "prompt",
-                    agent_message_handler=warnings.append,
+                    agent_message_handler=agent_messages.append,
                 )
                 self.assertTrue(runner.git_puller.wait(1))
 
         self.assertEqual(response, "response")
-        self.assertEqual(warnings, [GIT_PULL_WARNING_MESSAGE])
+        self.assertEqual(agent_messages, [])
         runner.client.run_turn.assert_called_once()
         self.assertTrue(any("asynchronous Git update failed" in line for line in logs.output))
 
@@ -3724,6 +3723,48 @@ class ConversationControllerTest(unittest.TestCase):
         running_turn = RunningCodexTurn(-1001, "thread-one", handle)
         bot.codex.begin_turn.return_value = running_turn
         return bot, running_turn
+
+    def test_git_pull_failure_does_not_send_a_controller_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bot, _ = self.build_bot(Path(temp_dir))
+            bot.codex = CodexRunner(bot.config, bot.telegram)
+            bot.codex.client = MagicMock()
+            bot.codex.client.generation = 1
+            bot.codex.client.start_thread.return_value = "thread-one"
+            handle = CodexTurnHandle("thread-one", "turn-one", queue.Queue())
+            bot.codex.client.start_turn.return_value = handle
+            controller = ConversationController(bot, -1001)
+            self.addCleanup(controller.shutdown)
+            message = {
+                "message_id": 1,
+                "text": "status",
+                "chat": {"id": -1001, "type": "supergroup"},
+            }
+
+            with (
+                patch(
+                    "bot.pull_configured_git_repositories",
+                    side_effect=GitPullError("network unavailable"),
+                ),
+                self.assertLogs("bot", level="WARNING") as logs,
+            ):
+                controller._process_incoming("message", message)
+                self.assertTrue(bot.codex.git_puller.wait(1))
+                controller._drain()
+                bot.send_message_response.assert_not_called()
+                running_turn = controller.active_turn
+                self.assertIs(running_turn.handle, handle)
+
+                controller._process_agent_message(
+                    CodexAgentMessage("turn-one", "final-one", "final_answer", "Final answer."),
+                )
+                controller._process_turn_completed(running_turn, "Final answer.", None)
+
+            bot.send_message_response.assert_called_once()
+            self.assertEqual(bot.send_message_response.call_args.args[1], "Final answer.")
+            self.assertTrue(
+                any("asynchronous Git update failed" in line for line in logs.output),
+            )
 
     def test_second_message_steers_the_active_turn(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5872,39 +5913,62 @@ class CodexProgressLoggingTest(unittest.TestCase):
         self.assertEqual(reply_message_ids, [2399, None])
         self.assertTrue(any("already sent as an agent message" in line for line in logs.output))
 
-    def test_standard_git_pull_warning_is_sent_before_response(self) -> None:
-        bot = object.__new__(Bot)
-        bot.config = build_config(Path("."))
-        bot.attachments = MagicMock()
-        bot.attachments.prepare_message.return_value = (None, False)
-        bot.telegram = MagicMock()
-        bot.codex = MagicMock()
-        bot.bot_user = {}
+    def test_late_git_pull_failure_is_logged_without_sending_a_telegram_message(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bot = object.__new__(Bot)
+            bot.config = build_config(Path(temp_dir))
+            bot.attachments = MagicMock()
+            bot.attachments.prepare_message.return_value = (None, False)
+            bot.telegram = MagicMock()
+            bot.codex = CodexRunner(bot.config, bot.telegram)
+            bot.codex.client = MagicMock()
+            bot.codex.client.generation = 1
+            bot.codex.client.start_thread.return_value = "session-one"
+            bot.bot_user = {}
+            pull_started = threading.Event()
+            release_pull = threading.Event()
 
-        def run_codex(
-            chat_id: int,
-            prompt: str,
-            image_paths: list[Path],
-            agent_message_handler: Callable[[str], None],
-            thread_name: str | None = None,
-        ) -> str:
-            agent_message_handler(GIT_PULL_WARNING_MESSAGE)
-            return "Final answer."
+            def fail_pull(repo_dir: Path, timeout: int) -> list[tuple[Path, str]]:
+                pull_started.set()
+                release_pull.wait(1)
+                raise GitPullError("network unavailable")
 
-        bot.codex.run.side_effect = run_codex
-        message = {
-            "message_id": 2402,
-            "text": "status",
-            "chat": {"id": -1001, "type": "supergroup"},
-        }
+            def run_turn(
+                thread_id: str,
+                prompt: object,
+                image_paths: list[Path],
+                agent_message_handler: Callable[[str], None],
+                fast_mode: bool,
+            ) -> str:
+                agent_message_handler("Working on it.")
+                agent_message_handler("Final answer.")
+                return "Final answer."
 
-        with self.assertLogs("bot", level="INFO"):
-            bot.handle_message(message)
+            bot.codex.client.run_turn.side_effect = run_turn
+            message = {
+                "message_id": 2402,
+                "text": "status",
+                "chat": {"id": -1001, "type": "supergroup"},
+            }
+            with (
+                patch("bot.pull_configured_git_repositories", side_effect=fail_pull),
+                self.assertLogs("bot", level="WARNING") as logs,
+            ):
+                try:
+                    bot.handle_message(message)
+                    self.assertTrue(pull_started.wait(1))
+                finally:
+                    release_pull.set()
+                    self.assertTrue(bot.codex.git_puller.wait(1))
 
-        delivered_texts = [call.args[1] for call in bot.telegram.send_rich_message.call_args_list]
-        reply_message_ids = [call.args[2] for call in bot.telegram.send_rich_message.call_args_list]
-        self.assertEqual(delivered_texts, [GIT_PULL_WARNING_MESSAGE, "Final answer."])
-        self.assertEqual(reply_message_ids, [2402, None])
+            delivered_texts = [
+                call.args[1] for call in bot.telegram.send_rich_message.call_args_list
+            ]
+            self.assertEqual(delivered_texts, ["Working on it.", "Final answer."])
+            bot.telegram.send_plain_message.assert_not_called()
+            self.assertTrue(
+                any("asynchronous Git update failed" in line for line in logs.output),
+            )
 
     def test_failed_streamed_final_is_retried_from_output_file(self) -> None:
         bot = object.__new__(Bot)

@@ -85,8 +85,7 @@ repository. Missing and non-Git roots are skipped; duplicate roots and paths ins
 are pulled only once. At most one pull batch runs at a time, and a new batch is skipped when the last successful
 one completed less than five minutes ago. Each pull updates the checked-out branch and its populated submodules.
 Codex does not wait for the pull, so on a cache miss it may briefly read a checkout while Git is updating it.
-Pull failures are logged but do not stop Codex: ordinary private and group chats receive a warning, which may
-arrive after the Codex response, while guest-mode requests remain silent to preserve their single response.
+Pull failures are logged only; Codex continues processing the request.
 
 ## Run
 

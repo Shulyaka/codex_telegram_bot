@@ -71,10 +71,6 @@ MARKDOWN_IMAGE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 MARKDOWN_FENCE_PATTERN = re.compile(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})")
-GIT_PULL_WARNING_MESSAGE = (
-    "⚠️ I couldn't update one or more Git repositories. "
-    "Continuing with the existing local checkout."
-)
 GUEST_RESPONSE_WARNING_MESSAGE = (
     "I am still working on it and need some more time. Telegram does not allow "
     "guest responses after 5 minutes. Please give me a couple more minutes and then ping me."
@@ -3356,18 +3352,12 @@ class AsyncGitPuller:
         self.lock = threading.Lock()
         self.active_thread: threading.Thread | None = None
         self.latest_thread: threading.Thread | None = None
-        self.failure_handlers: list[Callable[[str], None]] = []
         self.last_success_at: float | None = None
 
-    def start_if_due(
-        self,
-        failure_handler: Callable[[str], None] | None = None,
-    ) -> bool:
+    def start_if_due(self) -> bool:
         with self.lock:
             now = time.monotonic()
             if self.active_thread is not None:
-                if failure_handler:
-                    self.failure_handlers.append(failure_handler)
                 logger.debug("skipping Git update: an asynchronous pull is already running")
                 return False
             if (
@@ -3380,7 +3370,6 @@ class AsyncGitPuller:
                 )
                 return False
 
-            self.failure_handlers = [failure_handler] if failure_handler else []
             pull_thread = threading.Thread(
                 target=self._pull,
                 name="codex-git-pull",
@@ -3412,20 +3401,12 @@ class AsyncGitPuller:
                 safe_log_text(str(err)),
             )
             with self.lock:
-                failure_handlers = self.failure_handlers
-                self.failure_handlers = []
                 self.active_thread = None
-            for failure_handler in failure_handlers:
-                try:
-                    failure_handler(GIT_PULL_WARNING_MESSAGE)
-                except Exception:
-                    logger.exception("failed to deliver asynchronous Git pull warning")
             return
 
         completed_at = time.monotonic()
         with self.lock:
             self.last_success_at = completed_at
-            self.failure_handlers = []
             self.active_thread = None
         logger.info(
             "configured Git repositories are up to date: %s",
@@ -3508,7 +3489,7 @@ class CodexRunner:
         fast_mode: bool = False,
         thread_name: str | None = None,
     ) -> str:
-        self.git_puller.start_if_due(agent_message_handler)
+        self.git_puller.start_if_due()
         with self._chat_lock(chat_id):
             try:
                 if chat_id in self.active_turns:
@@ -3538,14 +3519,13 @@ class CodexRunner:
         prompt: str | list[str] | Callable[[SessionRecord | None], str | list[str]],
         image_paths: list[Path] | None = None,
         agent_message_handler: Callable[[CodexAgentMessage], None] | None = None,
-        git_failure_handler: Callable[[str], None] | None = None,
         fast_mode: bool = False,
         generated_image_handler: Callable[[CodexGeneratedImage], None] | None = None,
         thread_name: str | None = None,
         message_thread_id: int | None = None,
         image_generation_started_handler: Callable[[], None] | None = None,
     ) -> RunningCodexTurn:
-        self.git_puller.start_if_due(git_failure_handler)
+        self.git_puller.start_if_due()
         with self._chat_lock(chat_id):
             if chat_id in self.active_turns:
                 raise CodexAppServerError(f"chat {chat_id} already has an active Codex turn")
@@ -4799,8 +4779,6 @@ class ConversationController:
             self._process_generated_image(payload)
         elif event_type == "image_generation_started":
             self._process_image_generation_started()
-        elif event_type == "git_warning":
-            self._process_git_warning(*payload)
         elif event_type == "turn_completed":
             self._process_turn_completed(*payload)
         elif event_type == "guest_deadline":
@@ -4924,17 +4902,12 @@ class ConversationController:
         self._activate_target(prepared.kind, prepared.message)
         self.original_guest_target = self.target if prepared.kind == "guest_message" else None
         self.guest_steer_count = 0
-        target_generation = self.target_generation
         try:
             running_turn = self.bot.codex.begin_turn(
                 self.conversation_key,
                 prepared.prompt,
                 prepared.image_paths,
                 agent_message_handler=lambda message: self.enqueue("agent_message", message),
-                git_failure_handler=lambda warning: self.enqueue(
-                    "git_warning",
-                    (target_generation, warning),
-                ),
                 fast_mode=prepared.kind == "guest_message",
                 generated_image_handler=lambda image: self.enqueue("generated_image", image),
                 thread_name=telegram_thread_name(prepared.kind, prepared.message),
@@ -5077,17 +5050,6 @@ class ConversationController:
         self.bot.codex.send_optional_chat_action(
             self.conversation_key,
             "upload_photo",
-        )
-
-    def _process_git_warning(self, generation: int, warning: str) -> None:
-        target = self.target
-        if target is None or target.generation != generation or target.is_guest:
-            return
-        self._deliver_standard_message(
-            target,
-            warning,
-            "asynchronous Git pull warning",
-            record_as_bot_response=False,
         )
 
     def _process_turn_completed(
@@ -5719,10 +5681,10 @@ class Bot:
                     return
 
             try:
-                deliver_message(agent_message, "asynchronous Git pull warning")
+                deliver_message(agent_message, "agent message", record_as_bot_response=True)
             except Exception:
                 logger.exception(
-                    "failed to send asynchronous Git pull warning for message %s to chat %s",
+                    "failed to send late Codex agent message for message %s to chat %s",
                     message_id,
                     chat_id,
                 )
@@ -5739,7 +5701,7 @@ class Bot:
                     deliver_message(
                         agent_message,
                         f"agent message {message_number}",
-                        record_as_bot_response=agent_message != GIT_PULL_WARNING_MESSAGE,
+                        record_as_bot_response=True,
                     )
                     delivered_agent_messages.append(agent_message)
                 except Exception:
