@@ -142,6 +142,7 @@ class Config:
     media_upload_chat_id: int | None = None
     max_concurrent_chats: int = DEFAULT_MAX_CONCURRENT_CHATS
     sticker_dir: Path | None = None
+    read_only: bool = True
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -219,6 +220,7 @@ class Config:
                 DEFAULT_MAX_CONCURRENT_CHATS,
             ),
             sticker_dir=sticker_dir,
+            read_only=read_bool("CODEX_TELEGRAM_READ_ONLY", True),
         )
 
 
@@ -2052,13 +2054,15 @@ class CodexAppServerClient:
 
         configuration = {
             "cwd": str(self.config.repo_dir),
-            "approvalPolicy": "never",
-            "sandbox": "read-only",
+            "approvalPolicy": "never" if self.config.read_only else "on-request",
+            "sandbox": "read-only" if self.config.read_only else "workspace-write",
             "config": {
                 "mcp_servers": {"openaiDeveloperDocs": {"enabled": False}},
                 "web_search": "live",
             },
         }
+        if not self.config.read_only:
+            configuration["approvalsReviewer"] = "auto_review"
         if base_instructions is not None:
             configuration["baseInstructions"] = base_instructions
         if dynamic_tools is not None:
@@ -2099,16 +2103,22 @@ class CodexAppServerClient:
     ) -> CodexTurnHandle:
         event_queue = self._register_notification_queue(thread_id)
         try:
+            params = {
+                "threadId": thread_id,
+                "input": self._turn_inputs(prompt, image_paths),
+                "cwd": str(self.config.repo_dir),
+                "approvalPolicy": "never" if self.config.read_only else "on-request",
+                "serviceTier": "fast" if fast_mode else None,
+            }
+            if self.config.read_only:
+                params["sandboxPolicy"] = {"type": "readOnly"}
+            else:
+                # Inherit workspace-write and its effective roots/network settings
+                # from thread/start or thread/resume instead of resetting them.
+                params["approvalsReviewer"] = "auto_review"
             result = self.request(
                 "turn/start",
-                {
-                    "threadId": thread_id,
-                    "input": self._turn_inputs(prompt, image_paths),
-                    "cwd": str(self.config.repo_dir),
-                    "approvalPolicy": "never",
-                    "sandboxPolicy": {"type": "readOnly"},
-                    "serviceTier": "fast" if fast_mode else None,
-                },
+                params,
             )
             turn = result.get("turn") if isinstance(result, dict) else None
             turn_id = turn.get("id") if isinstance(turn, dict) else None

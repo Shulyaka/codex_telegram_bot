@@ -106,6 +106,52 @@ class ConfigurationTest(unittest.TestCase):
     def test_parse_multiple_chat_ids(self) -> None:
         self.assertEqual(parse_chat_ids("TEST_IDS", "-1001, -1002"), frozenset({-1001, -1002}))
 
+    def test_read_only_defaults_to_true(self) -> None:
+        environment = {
+            "TELEGRAM_BOT_TOKEN": "test-token",
+            "TELEGRAM_ALLOWED_CHAT_IDS": "-1001",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            config = Config.from_env()
+
+        self.assertTrue(config.read_only)
+
+    def test_read_only_can_be_configured(self) -> None:
+        for value, expected in (
+            ("true", True),
+            ("1", True),
+            ("yes", True),
+            ("on", True),
+            ("false", False),
+            ("0", False),
+            ("no", False),
+            ("off", False),
+            (" FALSE ", False),
+        ):
+            with self.subTest(value=value):
+                environment = {
+                    "TELEGRAM_BOT_TOKEN": "test-token",
+                    "TELEGRAM_ALLOWED_CHAT_IDS": "-1001",
+                    "CODEX_TELEGRAM_READ_ONLY": value,
+                }
+                with patch.dict(os.environ, environment, clear=True):
+                    config = Config.from_env()
+
+                self.assertIs(config.read_only, expected)
+
+    def test_read_only_rejects_invalid_value(self) -> None:
+        environment = {
+            "TELEGRAM_BOT_TOKEN": "test-token",
+            "TELEGRAM_ALLOWED_CHAT_IDS": "-1001",
+            "CODEX_TELEGRAM_READ_ONLY": "sometimes",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            with self.assertRaisesRegex(
+                ValueError,
+                "CODEX_TELEGRAM_READ_ONLY must be a boolean",
+            ):
+                Config.from_env()
+
     def test_legacy_single_chat_variable_is_supported(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             environment = {
@@ -4175,29 +4221,44 @@ class CodexProgressLoggingTest(unittest.TestCase):
             instructions_path = repo_dir / "tools" / "codex_telegram_bot" / "instructions.md"
             instructions_path.parent.mkdir(parents=True)
             instructions_path.write_text("Telegram bot instructions", encoding="utf-8")
-            client = CodexAppServerClient(build_config(repo_dir))
-            client.request = MagicMock(
-                side_effect=[
-                    {"thread": {"id": "thread-one"}},
-                    {"thread": {"id": "thread-one"}},
-                ],
-            )
+            for read_only, sandbox, approval_policy in (
+                (True, "read-only", "never"),
+                (False, "workspace-write", "on-request"),
+            ):
+                with self.subTest(read_only=read_only):
+                    client = CodexAppServerClient(
+                        build_config(repo_dir, read_only=read_only),
+                    )
+                    client.request = MagicMock(
+                        side_effect=[
+                            {"thread": {"id": "thread-one"}},
+                            {"thread": {"id": "thread-one"}},
+                        ],
+                    )
 
-            self.assertEqual(client.start_thread(), "thread-one")
-            client.resume_thread("thread-one")
+                    self.assertEqual(client.start_thread(), "thread-one")
+                    client.resume_thread("thread-one")
 
-        start_params = client.request.call_args_list[0].args[1]
-        resume_params = client.request.call_args_list[1].args[1]
-        for params in (start_params, resume_params):
-            self.assertEqual(params["cwd"], str(repo_dir))
-            self.assertEqual(params["sandbox"], "read-only")
-            self.assertEqual(params["baseInstructions"], "Telegram bot instructions")
-            self.assertEqual(params["config"]["web_search"], "live")
-            self.assertFalse(
-                params["config"]["mcp_servers"]["openaiDeveloperDocs"]["enabled"],
-            )
-        self.assertEqual(start_params["threadSource"], "codex_telegram_bot")
-        self.assertEqual(resume_params["threadId"], "thread-one")
+                    start_params = client.request.call_args_list[0].args[1]
+                    resume_params = client.request.call_args_list[1].args[1]
+                    for params in (start_params, resume_params):
+                        self.assertEqual(params["cwd"], str(repo_dir))
+                        self.assertEqual(params["sandbox"], sandbox)
+                        self.assertEqual(params["approvalPolicy"], approval_policy)
+                        if read_only:
+                            self.assertNotIn("approvalsReviewer", params)
+                        else:
+                            self.assertEqual(params["approvalsReviewer"], "auto_review")
+                        self.assertEqual(
+                            params["baseInstructions"],
+                            "Telegram bot instructions",
+                        )
+                        self.assertEqual(params["config"]["web_search"], "live")
+                        self.assertFalse(
+                            params["config"]["mcp_servers"]["openaiDeveloperDocs"]["enabled"],
+                        )
+                    self.assertEqual(start_params["threadSource"], "codex_telegram_bot")
+                    self.assertEqual(resume_params["threadId"], "thread-one")
 
     def test_missing_project_instructions_fall_back_to_standard_instructions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4669,6 +4730,32 @@ class CodexProgressLoggingTest(unittest.TestCase):
                 {"type": "localImage", "path": "/repo/image.png"},
             ],
         )
+
+    def test_turn_start_uses_configured_permissions_for_ordinary_and_guest_turns(self) -> None:
+        for read_only in (True, False):
+            for fast_mode in (False, True):
+                with self.subTest(read_only=read_only, guest=fast_mode):
+                    client = CodexAppServerClient(
+                        build_config(Path("/repo"), read_only=read_only),
+                    )
+                    client.start = MagicMock()
+                    client.request = MagicMock(return_value={"turn": {"id": "turn-one"}})
+
+                    client.start_turn("thread-one", "hello", [], None, fast_mode)
+
+                    method, params = client.request.call_args.args
+                    self.assertEqual(method, "turn/start")
+                    self.assertEqual(params["threadId"], "thread-one")
+                    self.assertEqual(params["cwd"], "/repo")
+                    self.assertEqual(params["serviceTier"], "fast" if fast_mode else None)
+                    if read_only:
+                        self.assertEqual(params["approvalPolicy"], "never")
+                        self.assertEqual(params["sandboxPolicy"], {"type": "readOnly"})
+                        self.assertNotIn("approvalsReviewer", params)
+                    else:
+                        self.assertEqual(params["approvalPolicy"], "on-request")
+                        self.assertEqual(params["approvalsReviewer"], "auto_review")
+                        self.assertNotIn("sandboxPolicy", params)
 
     def test_normal_turn_explicitly_clears_fast_tier(self) -> None:
         client = CodexAppServerClient(build_config(Path("/repo")))
@@ -5207,7 +5294,12 @@ def prompt_text(prompt: list[str]) -> str:
     return "\n".join(prompt)
 
 
-def build_config(temp_dir: Path, *, sticker_dir: Path | None = None) -> Config:
+def build_config(
+    temp_dir: Path,
+    *,
+    sticker_dir: Path | None = None,
+    read_only: bool = True,
+) -> Config:
     return Config(
         telegram_bot_token="test-token",
         allowed_chat_ids=frozenset({1001, -1001, -1002}),
@@ -5228,6 +5320,7 @@ def build_config(temp_dir: Path, *, sticker_dir: Path | None = None) -> Config:
         delete_webhook_on_start=False,
         drop_pending_updates_on_webhook_delete=False,
         sticker_dir=sticker_dir,
+        read_only=read_only,
     )
 
 

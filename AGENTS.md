@@ -30,6 +30,10 @@ Optional environment variables:
 - `CODEX_TELEGRAM_APP_SERVER_SOCKET` - Unix socket of the shared Codex app-server; defaults to
   `$CODEX_HOME/app-server-control/app-server-control.sock`, or `~/.codex/app-server-control/app-server-control.sock`
   when `CODEX_HOME` is unset.
+- `CODEX_TELEGRAM_READ_ONLY` - defaults to `true`, preserving the `read-only` sandbox and `never` approval
+  policy. Set to `false` for `workspace-write`, `on-request` approvals, and the `auto_review` approvals reviewer.
+  Auto-review can approve sandbox escalation for additional file or network access. The bot does not provide
+  manual approval prompts in Telegram; rejected requests remain blocked.
 - `CODEX_TELEGRAM_SESSION_STORE` - JSON file used to persist the Codex session ID for each chat; defaults to
   `sessions.json` in `CODEX_TELEGRAM_REPO_DIR`, keeping histories isolated between repositories.
 - `CODEX_TELEGRAM_CODEX_TIMEOUT_SECONDS` - Codex turn timeout; unset or `0` means no timeout.
