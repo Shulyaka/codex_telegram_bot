@@ -171,6 +171,10 @@ def _fingerprint(text: str | dict[str, Any]) -> str | None:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else None
 
 
+def response_fingerprint(text: str | dict[str, Any]) -> str | None:
+    return _fingerprint(text)
+
+
 class TelegramTopicHistory:
     def __init__(
         self,

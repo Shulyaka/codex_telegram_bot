@@ -144,6 +144,11 @@ For ordinary messages, the session store also keeps the Telegram message ID of t
 sent Codex response. If the next user message replies to that response while the same Codex thread is still
 mapped, the bot omits the redundant `reply_to_message` block from the model prompt. A newly created thread
 still receives the reply block, including when the old thread was archived or deleted between interactions.
+Guest replies use a persisted fingerprint of the latest successfully delivered model response instead of a
+numeric message ID. A same-chat reply from the current bot with a matching complete body omits both the
+reply metadata and quoted body while the same Codex thread remains mapped. Formatting and math delimiters
+are normalized before matching. New histories, older responses, and replies to synthetic warnings or errors
+retain their context. Only the fingerprint is stored, not the response body.
 The long poll also requests Telegram's `message_reaction` updates. When a user adds a supported reaction to
 the recorded latest bot response, the bot feeds the added emoji into the same ordinary-message turn/steering
 path with `message_kind` set to `message_reaction`. Reaction removals, aggregate count updates, and reactions
@@ -223,7 +228,8 @@ If another Codex client archives or deletes a mapped thread, the app-server noti
 mapping and the next Telegram message creates a fresh thread. If that notification was missed while the bot
 was disconnected, a specific archived-thread or missing-rollout error during resume or turn startup triggers
 the same cleanup and one retry with a new thread. Other app-server errors are not retried.
-The session store also records the last message, compaction time, and latest ordinary bot-response ID. On startup, threads idle for at
+The session store also records the last message, compaction time, latest ordinary bot-response ID, and latest
+guest response fingerprint. On startup, threads idle for at
 least seven days are archived and removed from the mapping, so their next message creates a fresh thread.
 Threads idle for at least 24 hours are compacted once per idle period through Codex's app-server API.
 Compaction is checked on startup and every hour only while the bot is waiting for Telegram updates and no
@@ -256,7 +262,7 @@ When the accepted message replies to another message with an image, that replied
 When the accepted message replies to another message with a file, that replied-to file path is included as context too.
 Guest messages use the same chat allow-list and reply with one rich `InlineQueryResultArticle`.
 Telegram's guest-query result exposes an inline message ID rather than the numeric message ID used by
-`reply_to_message`, so this reply-context deduplication applies only to ordinary bot messages.
+`reply_to_message`, so guest reply-context deduplication uses the delivered response fingerprint described above.
 Codex receives a structured Telegram context block with the asking user's name and any replied-to message.
 The `<telegram_context>` block and the Markdown user message are sent as separate text input items in the
 same app-server turn; the user message does not use an additional wrapper tag. The replied-to body is

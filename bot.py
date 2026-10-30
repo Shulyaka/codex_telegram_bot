@@ -42,12 +42,12 @@ try:
     from .telegram_entities_to_markdown import entities_to_markdown
     from .telegram_math import normalize_math_delimiters
     from .telegram_rich_to_markdown import rich_message_to_markdown
-    from .telegram_topic_history import TelegramTopicHistory, private_guest_chat_key
+    from .telegram_topic_history import TelegramTopicHistory, private_guest_chat_key, response_fingerprint
 except ImportError:
     from telegram_entities_to_markdown import entities_to_markdown
     from telegram_math import normalize_math_delimiters
     from telegram_rich_to_markdown import rich_message_to_markdown
-    from telegram_topic_history import TelegramTopicHistory, private_guest_chat_key
+    from telegram_topic_history import TelegramTopicHistory, private_guest_chat_key, response_fingerprint
 
 
 logger = logging.getLogger(__name__)
@@ -259,6 +259,7 @@ class TelegramFile:
 class GuestResponseDelivery:
     delivered: bool
     error: Exception | None = None
+    response_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1919,6 +1920,7 @@ class SessionRecord:
     last_message_at: float
     last_compacted_at: float | None = None
     last_bot_message_id: int | None = None
+    last_guest_response_fingerprint: str | None = None
 
 
 class SessionStore:
@@ -1978,11 +1980,17 @@ class SessionStore:
                 if old_record and old_record.session_id == session_id
                 else None
             )
+            last_guest_response_fingerprint = (
+                old_record.last_guest_response_fingerprint
+                if old_record and old_record.session_id == session_id
+                else None
+            )
             self.sessions[str(chat_id)] = SessionRecord(
                 session_id=session_id,
                 last_message_at=last_message_at if last_message_at is not None else time.time(),
                 last_compacted_at=last_compacted_at,
                 last_bot_message_id=last_bot_message_id,
+                last_guest_response_fingerprint=last_guest_response_fingerprint,
             )
             self._save()
 
@@ -1996,6 +2004,7 @@ class SessionStore:
                 last_message_at=last_message_at if last_message_at is not None else time.time(),
                 last_compacted_at=record.last_compacted_at,
                 last_bot_message_id=record.last_bot_message_id,
+                last_guest_response_fingerprint=record.last_guest_response_fingerprint,
             )
             self._save()
 
@@ -2014,6 +2023,7 @@ class SessionStore:
                 last_message_at=record.last_message_at,
                 last_compacted_at=compacted_at if compacted_at is not None else time.time(),
                 last_bot_message_id=record.last_bot_message_id,
+                last_guest_response_fingerprint=record.last_guest_response_fingerprint,
             )
             self._save()
             return True
@@ -2036,6 +2046,32 @@ class SessionStore:
                 last_message_at=record.last_message_at,
                 last_compacted_at=record.last_compacted_at,
                 last_bot_message_id=message_id,
+                last_guest_response_fingerprint=record.last_guest_response_fingerprint,
+            )
+            self._save()
+            return True
+
+    def record_guest_response(
+        self,
+        chat_id: ConversationKey,
+        expected_session_id: str,
+        fingerprint: str | None,
+    ) -> bool:
+        if not is_guest_conversation_key(chat_id) or (
+            fingerprint is not None
+            and (not isinstance(fingerprint, str) or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None)
+        ):
+            return False
+        with self.lock:
+            record = self.sessions.get(str(chat_id))
+            if record is None or record.session_id != expected_session_id:
+                return False
+            self.sessions[str(chat_id)] = SessionRecord(
+                session_id=record.session_id,
+                last_message_at=record.last_message_at,
+                last_compacted_at=record.last_compacted_at,
+                last_bot_message_id=record.last_bot_message_id,
+                last_guest_response_fingerprint=fingerprint,
             )
             self._save()
             return True
@@ -2134,6 +2170,7 @@ class SessionStore:
             last_message_at = value.get("last_message_at")
             last_compacted_at = value.get("last_compacted_at")
             last_bot_message_id = value.get("last_bot_message_id")
+            last_guest_response_fingerprint = value.get("last_guest_response_fingerprint")
             previous_response_error = value.get("previous_response_error")
             if (
                 not isinstance(session_id, str)
@@ -2151,6 +2188,13 @@ class SessionStore:
                     and not valid_telegram_message_id(last_bot_message_id)
                 )
                 or (
+                    last_guest_response_fingerprint is not None
+                    and (
+                        not isinstance(last_guest_response_fingerprint, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", last_guest_response_fingerprint) is None
+                    )
+                )
+                or (
                     previous_response_error is not None
                     and not isinstance(previous_response_error, str)
                 )
@@ -2161,6 +2205,7 @@ class SessionStore:
                 float(last_message_at),
                 float(last_compacted_at) if last_compacted_at is not None else None,
                 last_bot_message_id,
+                last_guest_response_fingerprint,
             )
             if previous_response_error:
                 loaded_response_errors.setdefault(chat_id, previous_response_error)
@@ -2183,6 +2228,7 @@ class SessionStore:
                         "last_message_at": record.last_message_at,
                         "last_compacted_at": record.last_compacted_at,
                         "last_bot_message_id": record.last_bot_message_id,
+                        "last_guest_response_fingerprint": record.last_guest_response_fingerprint,
                     }
                     for chat_id, record in self.sessions.items()
                 },
@@ -4020,6 +4066,14 @@ class CodexRunner:
             return False
         return self.sessions.record_bot_message(chat_id, record.session_id, message_id)
 
+    def record_guest_response(
+        self,
+        chat_id: ConversationKey,
+        expected_session_id: str,
+        fingerprint: str | None,
+    ) -> bool:
+        return self.sessions.record_guest_response(chat_id, expected_session_id, fingerprint)
+
     def conversation_key_for_last_bot_message(
         self,
         chat_id: int,
@@ -4823,6 +4877,7 @@ class TelegramResponseTarget:
     consumed_reason: str | None = None
     delivered_agent_messages: list[str] | None = None
     deadline_timer: threading.Timer | None = None
+    codex_session_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.delivered_agent_messages is None:
@@ -4993,28 +5048,17 @@ class ConversationController:
                 image_paths = []
                 file_paths = []
 
-            if kind != "guest_message":
-                def build_prompt(record: SessionRecord | None) -> list[str]:
-                    return build_codex_prompt(
-                        kind,
-                        message,
-                        self.bot.bot_user,
-                        file_paths,
-                        include_reply_to_message=not reply_targets_recorded_bot_message(
-                            message,
-                            record,
-                        ),
-                        previous_response_error=self._previous_response_error(),
-                    )
-            else:
-                def build_prompt(record: SessionRecord | None) -> list[str]:
-                    return build_codex_prompt(
-                        kind,
-                        message,
-                        self.bot.bot_user,
-                        file_paths,
-                        previous_response_error=self._previous_response_error(),
-                    )
+            def build_prompt(record: SessionRecord | None) -> list[str]:
+                return build_codex_prompt(
+                    kind,
+                    message,
+                    self.bot.bot_user,
+                    file_paths,
+                    include_reply_to_message=not reply_targets_recorded_bot_message(
+                        message, record, self.bot.bot_user,
+                    ),
+                    previous_response_error=self._previous_response_error(),
+                )
             return PreparedTelegramInput(
                 kind,
                 message,
@@ -5062,6 +5106,8 @@ class ConversationController:
             return
 
         self.active_turn = running_turn
+        if self.target is not None:
+            self.target.codex_session_id = running_turn.session_id
         self.deferred_attachment_cleanup.append(
             (prepared.message, prepared.clear_attachments),
         )
@@ -5225,6 +5271,13 @@ class ConversationController:
         self._stop_typing()
         self.target_generation += 1
         target = TelegramResponseTarget(kind, message, self.target_generation)
+        if target.is_guest:
+            session_id = (
+                self.active_turn.session_id
+                if self.active_turn is not None
+                else self.bot.codex.sessions.get(self.conversation_key)
+            )
+            target.codex_session_id = session_id if isinstance(session_id, str) else None
         self.target = target
         self.intermediate_messages.clear()
         if target.is_guest:
@@ -5271,6 +5324,9 @@ class ConversationController:
             "intermediate response before steer",
             frozenset(self.generated_image_paths),
         )
+        self.bot.record_guest_delivery(
+            self.conversation_key, target.codex_session_id, delivery, model_response=True,
+        )
         if delivery.error is not None:
             self.bot.codex.record_response_error(self.conversation_key, str(delivery.error))
         if delivery.delivered:
@@ -5296,6 +5352,9 @@ class ConversationController:
             "deadline warning",
             frozenset(self.generated_image_paths),
         )
+        self.bot.record_guest_delivery(
+            self.conversation_key, target.codex_session_id, delivery, model_response=False,
+        )
         if delivery.error is not None:
             self.bot.codex.record_response_error(self.conversation_key, str(delivery.error))
         if delivery.delivered:
@@ -5318,6 +5377,7 @@ class ConversationController:
                 response,
                 queued_stickers,
                 queued_files,
+                codex_succeeded=codex_succeeded,
             )
             return
         if codex_succeeded and not response.strip():
@@ -5349,6 +5409,8 @@ class ConversationController:
         response: str,
         queued_stickers: tuple[QueuedTelegramSticker, ...],
         queued_files: tuple[QueuedTelegramFile, ...] = (),
+        *,
+        codex_succeeded: bool = True,
     ) -> None:
         if target.response_sent:
             if target.consumed_reason == "deadline":
@@ -5371,6 +5433,9 @@ class ConversationController:
                 "response",
             )
             if delivery.delivered:
+                self.bot.record_guest_delivery(
+                    self.conversation_key, target.codex_session_id, delivery, model_response=False,
+                )
                 target.response_sent = True
                 return
 
@@ -5393,6 +5458,9 @@ class ConversationController:
                 "sticker response before steer",
             )
             if delivery.delivered:
+                self.bot.record_guest_delivery(
+                    self.conversation_key, original_target.codex_session_id, delivery, model_response=False,
+                )
                 original_target.response_sent = True
                 queued_stickers = ()
 
@@ -5411,6 +5479,9 @@ class ConversationController:
             "response",
             frozenset(generated_image_paths),
             **file_arguments,
+        )
+        self.bot.record_guest_delivery(
+            self.conversation_key, target.codex_session_id, delivery, model_response=codex_succeeded,
         )
         if delivery.error is not None:
             self.bot.codex.record_response_error(
@@ -5448,11 +5519,19 @@ class ConversationController:
     ) -> None:
         response = self._execution_error(error)
         if kind == "guest_message" and message.get("guest_query_id"):
+            session_id = (
+                self.active_turn.session_id
+                if self.active_turn is not None
+                else self.bot.codex.sessions.get(self.conversation_key)
+            )
             delivery = self.bot.answer_guest_response(
                 message["guest_query_id"],
                 response,
                 message,
                 "execution error",
+            )
+            self.bot.record_guest_delivery(
+                self.conversation_key, session_id, delivery, model_response=False,
             )
             if delivery.error is not None:
                 self.bot.codex.record_response_error(
@@ -6060,6 +6139,8 @@ class Bot:
         )
         chat_id = message["chat"]["id"]
         conversation_key = telegram_message_conversation_key("guest_message", message)
+        session_id = self.codex.sessions.get(conversation_key)
+        originating_session_id = session_id if isinstance(session_id, str) else None
         previous_response_error = self.codex.previous_response_error(conversation_key)
         if not isinstance(previous_response_error, str):
             previous_response_error = None
@@ -6072,11 +6153,15 @@ class Bot:
             with guest_response_lock:
                 if turn_finished.is_set() or guest_response_sent:
                     return
+                response_session_id = originating_session_id
                 delivery = self.answer_guest_response(
                     guest_query_id,
                     GUEST_RESPONSE_WARNING_MESSAGE,
                     message,
                     "deadline warning",
+                )
+                self.record_guest_delivery(
+                    conversation_key, response_session_id, delivery, model_response=False,
                 )
                 if delivery.error is not None:
                     self.codex.record_response_error(conversation_key, str(delivery.error))
@@ -6093,6 +6178,7 @@ class Bot:
         deadline_timer.start()
 
         clear_attachments = False
+        codex_succeeded = False
         try:
             attachment_dir, clear_attachments = self.attachments.prepare_message(
                 message,
@@ -6105,11 +6191,17 @@ class Bot:
                 image_paths = []
                 file_paths = []
             def build_prompt(record: SessionRecord | None) -> list[str]:
+                nonlocal originating_session_id
+                session_id = record.session_id if record is not None else self.codex.sessions.get(conversation_key)
+                originating_session_id = session_id if isinstance(session_id, str) else None
                 return build_codex_prompt(
                     "guest_message",
                     message,
                     self.bot_user,
                     file_paths,
+                    include_reply_to_message=not reply_targets_recorded_bot_message(
+                        message, record, self.bot_user,
+                    ),
                     previous_response_error=previous_response_error,
                 )
 
@@ -6120,6 +6212,7 @@ class Bot:
                 fast_mode=True,
                 thread_name=telegram_thread_name("guest_message", message),
             )
+            codex_succeeded = True
             logger.info(
                 "codex response ready for guest message %s from chat %s (%s characters)",
                 message.get("message_id"),
@@ -6155,6 +6248,9 @@ class Bot:
                 message,
                 "response",
             )
+            self.record_guest_delivery(
+                conversation_key, originating_session_id, delivery, model_response=codex_succeeded,
+            )
             if delivery.error is not None:
                 self.codex.record_response_error(conversation_key, str(delivery.error))
 
@@ -6186,7 +6282,7 @@ class Bot:
                 )
             else:
                 delivered_content = self.telegram.answer_guest_query(guest_query_id, response)
-            self.remember_guest_response_topic(
+            fingerprint = self.remember_guest_response_topic(
                 message,
                 delivered_content if isinstance(delivered_content, (str, dict)) else response,
             )
@@ -6196,7 +6292,7 @@ class Bot:
                 message_id,
                 chat_id,
             )
-            return GuestResponseDelivery(True)
+            return GuestResponseDelivery(True, response_fingerprint=fingerprint)
         except Exception as err:
             rich_error = err
             logger.exception(
@@ -6231,10 +6327,15 @@ class Bot:
         self,
         message: dict[str, Any],
         content: str | dict[str, Any],
-    ) -> None:
+    ) -> str | None:
+        try:
+            fingerprint = response_fingerprint(content)
+        except Exception:
+            logger.warning("failed to fingerprint the delivered guest response", exc_info=True)
+            fingerprint = None
         history = getattr(self, "topic_history", None)
         if history is None:
-            return
+            return fingerprint
         try:
             history.record_response("guest_message", message, content)
         except Exception:
@@ -6242,6 +6343,27 @@ class Bot:
                 "failed to remember guest response topic for chat %s",
                 message.get("chat", {}).get("id"),
             )
+        return fingerprint
+
+    def record_guest_delivery(
+        self,
+        conversation_key: ConversationKey,
+        session_id: str | None,
+        delivery: GuestResponseDelivery,
+        *,
+        model_response: bool,
+    ) -> None:
+        if not delivery.delivered or not isinstance(session_id, str) or not session_id:
+            return
+        fingerprint = (
+            delivery.response_fingerprint
+            if model_response and delivery.error is None
+            else None
+        )
+        try:
+            self.codex.record_guest_response(conversation_key, session_id, fingerprint)
+        except Exception:
+            logger.exception("failed to record the latest guest response for Codex thread %s", session_id)
 
     def answer_guest_sticker_response(
         self,
@@ -6964,11 +7086,42 @@ def quote_markdown(markdown: str) -> str:
 def reply_targets_recorded_bot_message(
     message: dict[str, Any],
     record: SessionRecord | None,
+    bot_user: dict[str, Any] | None = None,
 ) -> bool:
-    if not record or record.last_bot_message_id is None:
+    if not record:
         return False
     reply_to_message = message.get("reply_to_message")
     if not isinstance(reply_to_message, dict):
+        return False
+    if message.get("guest_query_id"):
+        if record.last_guest_response_fingerprint is None or not isinstance(bot_user, dict):
+            return False
+        if message.get("external_reply") is not None:
+            return False
+        sender = reply_to_message.get("from")
+        bot_id = bot_user.get("id")
+        if (
+            not valid_telegram_message_id(bot_id)
+            or not isinstance(sender, dict)
+            or not valid_telegram_message_id(sender.get("id"))
+            or sender["id"] != bot_id
+        ):
+            return False
+        current_chat = message.get("chat")
+        reply_chat = reply_to_message.get("chat")
+        if not isinstance(current_chat, dict) or not isinstance(current_chat.get("id"), int):
+            return False
+        if reply_chat is not None and (
+            not isinstance(reply_chat, dict) or reply_chat.get("id") != current_chat["id"]
+        ):
+            return False
+        try:
+            fingerprint = response_fingerprint(format_current_message_markdown(reply_to_message))
+        except Exception:
+            logger.warning("failed to fingerprint replied-to guest response; retaining reply context", exc_info=True)
+            return False
+        return fingerprint is not None and fingerprint == record.last_guest_response_fingerprint
+    if record.last_bot_message_id is None:
         return False
     reply_message_id = reply_to_message.get("message_id")
     return (
