@@ -39,7 +39,9 @@ Optional environment variables:
   Auto-review can approve sandbox escalation for additional file or network access. The bot does not provide
   manual approval prompts in Telegram; rejected requests remain blocked.
 - `CODEX_TELEGRAM_SESSION_STORE` - JSON file used to persist the Codex session ID for each chat; defaults to
-  `sessions.json` in `CODEX_TELEGRAM_REPO_DIR`, keeping histories isolated between repositories.
+  `sessions.json` in `CODEX_TELEGRAM_REPO_DIR`, keeping histories isolated between repositories. Telegram topic
+  recovery uses a separate file beside it, replacing the filename suffix with `.topics.json`
+  (`sessions.topics.json` by default).
 - `CODEX_TELEGRAM_CODEX_TIMEOUT_SECONDS` - Codex turn timeout; unset or `0` means no timeout.
 - `CODEX_TELEGRAM_ATTACHMENT_RETENTION_SECONDS` - minimum time downloaded Telegram attachments remain
   available after their most recent use; defaults to `86400` (24 hours).
@@ -149,6 +151,20 @@ The first accepted message from a chat or forum topic creates a Codex session. L
 conversation's stored session, including after the bot restarts. Non-threaded chats retain their original
 chat-ID-based session keys. Existing chat-wide mappings are preserved during upgrade but are not assigned to
 an arbitrary forum topic; each topic creates its own history when it is first used.
+Before selecting a conversation, the bot resolves the Telegram topic from the current message, a same-chat
+reply's topic or creation header, or previously observed message IDs. When those fields are missing, a reply
+to the current bot can also be matched against a previously delivered response using a fingerprint of its
+complete body with presentation formatting normalized. Guest and ordinary histories are separate, and matches
+are scoped to the Telegram chat. Responses seen in multiple topics, or with an unknown topic, are ambiguous
+and do not select a topic. Explicit non-topic messages do not acquire a topic through inference.
+The topic-history file stores message IDs, topic IDs, and response fingerprints rather than message bodies.
+It survives restarts and Codex thread archival. Recovering a topic happens before session routing, attachment
+handling, and prompt construction; the resolved ID is included as top-level `message_thread_id` in
+`<telegram_context>`. Without enough evidence, the message retains the existing chat-wide routing behavior.
+
+Topic recovery learns from live Telegram messages and successful bot deliveries. An older reply without
+enough evidence can remain chat-wide until a later message supplies the topic ID or its creation header.
+Copy the topic-history file together with the session store when moving the bot's runtime data.
 New Codex threads receive a user-facing name immediately after creation. Group and supergroup threads use
 the Telegram chat title, followed by the numeric topic ID for forum topics. Direct user-to-bot threads use
 `@username` when available or the Telegram
@@ -242,6 +258,8 @@ entities. Converted rich bodies and the redundant
 `quoted_original_message` field are removed from the structured reply metadata. Converted `text`/`entities`
 and `caption`/`caption_entities` fields are removed as well; an empty `raw_payload` is omitted. The current
 user message is converted by the same format-specific path but is not quoted.
+Replies to service messages and other messages without a text, caption, or rich body retain their structured
+metadata once; the bot does not additionally turn that metadata into a synthetic JSON quote.
 
 ### Telegram Rich Message conversion
 

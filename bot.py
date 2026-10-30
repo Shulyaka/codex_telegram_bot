@@ -41,9 +41,11 @@ from telegramify_markdown import MessageEntity, entities_to_markdownv2, telegram
 try:
     from .telegram_entities_to_markdown import entities_to_markdown
     from .telegram_rich_to_markdown import rich_message_to_markdown
+    from .telegram_topic_history import TelegramTopicHistory
 except ImportError:
     from telegram_entities_to_markdown import entities_to_markdown
     from telegram_rich_to_markdown import rich_message_to_markdown
+    from telegram_topic_history import TelegramTopicHistory
 
 
 logger = logging.getLogger(__name__)
@@ -1092,6 +1094,7 @@ class TelegramClient:
             tuple[Coroutine[Any, Any, Any] | None, Future[Any]]
         ] = queue.Queue()
         self.command_tasks: set[asyncio.Task[Any]] = set()
+        self.topic_history: TelegramTopicHistory | None = None
 
     def get_updates(self, offset: int | None, timeout_seconds: int) -> list[dict[str, Any]]:
         updates = self._submit(
@@ -1165,7 +1168,7 @@ class TelegramClient:
         text: str,
         generated_image_paths: frozenset[Path] = frozenset(),
         queued_files: tuple[QueuedTelegramFile, ...] = (),
-    ) -> None:
+    ) -> dict[str, Any]:
         prepared_markdown, references = extract_telegram_rich_media(
             text,
             self.allowed_media_roots,
@@ -1229,6 +1232,7 @@ class TelegramClient:
                     "result": self.build_guest_rich_result(rich_message),
                 },
             )
+            return rich_message
         finally:
             self.delete_guest_upload_messages(upload_message_ids)
 
@@ -1333,6 +1337,39 @@ class TelegramClient:
     def send_typing_action(self, chat_id: int, message_thread_id: int | None) -> None:
         self.send_chat_action(chat_id, message_thread_id, "typing")
 
+    def remember_response_topic(
+        self,
+        chat_id: int,
+        message_thread_id: int | None,
+        response: dict[str, Any],
+        text: str = "",
+    ) -> None:
+        history = getattr(self, "topic_history", None)
+        if history is None:
+            return
+        try:
+            message: dict[str, Any] = {
+                "chat": {"id": chat_id},
+                "message_thread_id": message_thread_id,
+            }
+            result = response.get("result")
+            if isinstance(result, dict):
+                delivered_text = format_current_message_markdown(result)
+                if delivered_text:
+                    text = delivered_text
+                if valid_message_thread_id(result.get("message_thread_id")):
+                    message["message_thread_id"] = result["message_thread_id"]
+                if result.get("is_topic_message") is False:
+                    message.pop("message_thread_id", None)
+            history.record_response(
+                "message",
+                message,
+                text,
+                telegram_response_message_id(response),
+            )
+        except Exception:
+            logger.exception("failed to remember Telegram response topic for chat %s", chat_id)
+
     def set_message_reaction(self, chat_id: int, message_id: int, reaction: str) -> None:
         response = self._api(
             "setMessageReaction",
@@ -1380,6 +1417,7 @@ class TelegramClient:
                     {"sticker": sticker_path},
                 )
                 self.uploaded_sticker_file_ids[cache_key] = telegram_sticker_file_id(response)
+        self.remember_response_topic(chat_id, message_thread_id, response)
         return telegram_response_message_id(response)
 
     def upload_sticker_for_guest(self, sticker_path: Path) -> GuestUploadedPhoto:
@@ -1437,6 +1475,7 @@ class TelegramClient:
             )
         else:
             response = self._api_multipart("sendDocument", payload, {"document": path})
+        self.remember_response_topic(chat_id, message_thread_id, response, caption or "")
         return telegram_response_message_id(response)
 
     def upload_document_for_guest(
@@ -1503,6 +1542,12 @@ class TelegramClient:
                 if part.uploads
                 else self._api("sendRichMessage", payload)
             )
+            self.remember_response_topic(
+                chat_id,
+                message_thread_id,
+                response,
+                text if len(parts) == 1 else "",
+            )
             response_message_id = telegram_response_message_id(response)
             if response_message_id is not None:
                 sent_message_id = response_message_id
@@ -1528,6 +1573,7 @@ class TelegramClient:
                 payload["message_thread_id"] = message_thread_id
 
             response = self._api("sendMessage", payload)
+            self.remember_response_topic(chat_id, message_thread_id, response, chunk)
             response_message_id = telegram_response_message_id(response)
             if response_message_id is not None:
                 sent_message_id = response_message_id
@@ -5366,6 +5412,10 @@ class ConversationController:
 class Bot:
     def __init__(self, config: Config) -> None:
         self.config = config
+        self.topic_history = TelegramTopicHistory(
+            config.session_store_path.with_name(f"{config.session_store_path.stem}.topics.json"),
+            message_text=format_current_message_markdown,
+        )
         media_roots = [config.repo_dir.resolve(), *configured_writable_roots(config.repo_dir)]
         if config.sticker_dir is not None:
             media_roots.append(config.sticker_dir.resolve())
@@ -5377,6 +5427,7 @@ class Bot:
             config.media_upload_chat_id,
             allowed_media_roots,
         )
+        self.telegram.topic_history = self.topic_history
         self.codex = CodexRunner(config, self.telegram)
         self.attachments = AttachmentStore(
             config.repo_dir,
@@ -5481,6 +5532,7 @@ class Bot:
             return
         if not self.is_allowed_message(message):
             return
+        message = self.resolve_message_topic(kind, message)
         chat_id = message.get("chat", {}).get("id")
         if not isinstance(chat_id, int):
             logger.info("ignored update %s: no numeric chat id", update.get("update_id"))
@@ -5496,6 +5548,12 @@ class Bot:
                 controller = ConversationController(self, chat_id, conversation_key)
                 self.controllers[conversation_key] = controller
         controller.enqueue("incoming", (kind, message))
+
+    def resolve_message_topic(self, kind: str, message: dict[str, Any]) -> dict[str, Any]:
+        history = getattr(self, "topic_history", None)
+        if history is None:
+            return message
+        return history.resolve(kind, message, self.bot_user)
 
     def dispatch_message_reaction(
         self,
@@ -5612,6 +5670,7 @@ class Bot:
     def handle_message(self, message: dict[str, Any]) -> None:
         if not self.is_allowed_message(message):
             return
+        message = self.resolve_message_topic("message", message)
 
         command = telegram_session_command(message, self.bot_user)
         if command:
@@ -5896,6 +5955,7 @@ class Bot:
     def handle_guest_message(self, message: dict[str, Any]) -> None:
         if not self.is_allowed_message(message):
             return
+        message = self.resolve_message_topic("guest_message", message)
 
         guest_query_id = message.get("guest_query_id")
         if not guest_query_id:
@@ -6032,20 +6092,24 @@ class Bot:
         rich_error: Exception | None = None
         try:
             if queued_files:
-                self.telegram.answer_guest_query(
+                delivered_content = self.telegram.answer_guest_query(
                     guest_query_id,
                     response,
                     generated_image_paths,
                     queued_files=queued_files,
                 )
             elif generated_image_paths:
-                self.telegram.answer_guest_query(
+                delivered_content = self.telegram.answer_guest_query(
                     guest_query_id,
                     response,
                     generated_image_paths,
                 )
             else:
-                self.telegram.answer_guest_query(guest_query_id, response)
+                delivered_content = self.telegram.answer_guest_query(guest_query_id, response)
+            self.remember_guest_response_topic(
+                message,
+                delivered_content if isinstance(delivered_content, (str, dict)) else response,
+            )
             logger.info(
                 "sent rich %s for guest message %s to chat %s",
                 response_kind,
@@ -6068,6 +6132,7 @@ class Bot:
                 guest_query_id,
                 telegram_delivery_error_message(rich_error),
             )
+            self.remember_guest_response_topic(message, telegram_delivery_error_message(rich_error))
             logger.info(
                 "sent plain-text delivery error for rich %s for guest message %s to chat %s",
                 response_kind,
@@ -6081,6 +6146,22 @@ class Bot:
                 response_kind,
             )
             return GuestResponseDelivery(False, err)
+
+    def remember_guest_response_topic(
+        self,
+        message: dict[str, Any],
+        content: str | dict[str, Any],
+    ) -> None:
+        history = getattr(self, "topic_history", None)
+        if history is None:
+            return
+        try:
+            history.record_response("guest_message", message, content)
+        except Exception:
+            logger.exception(
+                "failed to remember guest response topic for chat %s",
+                message.get("chat", {}).get("id"),
+            )
 
     def answer_guest_sticker_response(
         self,
@@ -6616,6 +6697,9 @@ def build_codex_prompt(
         "chat": format_chat(message.get("chat", {})),
         "asking_user": format_user(message.get("from", {})),
     }
+    message_thread_id = message.get("message_thread_id")
+    if valid_message_thread_id(message_thread_id):
+        context["message_thread_id"] = message_thread_id
     if message_kind != "message_reaction":
         context["current_message"] = {
             "message_id": message.get("message_id"),
@@ -6683,6 +6767,10 @@ def format_reply_quotes(
         else None
     )
     raw_text = raw_payload.get("text") or raw_payload.get("caption")
+    if not raw_text and message.get("rich_message") is None:
+        # A serialized payload is metadata rather than a quoted message body.
+        # Keep it once in structured reply metadata instead of quoting its JSON.
+        quoted_content = None
 
     rich_message = message.get("rich_message")
     rich_conversion_failed = False

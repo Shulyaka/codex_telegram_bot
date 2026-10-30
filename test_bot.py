@@ -1062,6 +1062,125 @@ class TelegramReplyTest(unittest.TestCase):
 
 
 class CodexPromptTest(unittest.TestCase):
+    def test_topic_identity_is_exposed_for_messages_guests_and_reactions(self) -> None:
+        for message_kind in ("message", "guest_message", "message_reaction"):
+            with self.subTest(message_kind=message_kind):
+                message = {
+                    "message_id": 2846,
+                    "date": 1785000000,
+                    "message_thread_id": 2844,
+                    "text": "Follow up",
+                    "chat": {"id": -1001, "type": "supergroup"},
+                    "from": {"id": 1001, "first_name": "Test"},
+                }
+
+                prompt = build_codex_prompt(message_kind, message, {})
+                context = prompt_context(prompt)
+
+                self.assertEqual(context["message_thread_id"], 2844)
+                self.assertEqual(prompt_user_message(prompt), "Follow up")
+                if message_kind == "message_reaction":
+                    self.assertNotIn("current_message", context)
+
+    def test_invalid_or_missing_topic_identity_is_omitted_from_context(self) -> None:
+        for message_thread_id in (None, 0, -1, True, "2844"):
+            with self.subTest(message_thread_id=message_thread_id):
+                message = {
+                    "message_id": 2846,
+                    "text": "Follow up",
+                    "message_thread_id": message_thread_id,
+                    "chat": {"id": -1001, "type": "supergroup"},
+                }
+
+                prompt = build_codex_prompt("message", message, {})
+
+                self.assertNotIn("message_thread_id", prompt_context(prompt))
+
+    def test_topic_creation_reply_is_metadata_without_a_duplicate_json_quote(self) -> None:
+        topic_created = {"name": "Project discussion", "icon_color": 7322096}
+        reply_payload = {
+            "forum_topic_created": topic_created,
+            "channel_chat_created": False,
+            "delete_chat_photo": False,
+            "group_chat_created": False,
+            "supergroup_chat_created": False,
+        }
+        for message_kind in ("message", "guest_message"):
+            with self.subTest(message_kind=message_kind):
+                message = {
+                    "message_id": 2846,
+                    "date": 1785000000,
+                    "message_thread_id": 2844,
+                    "text": "Follow up",
+                    "chat": {"id": -1001, "type": "supergroup"},
+                    "reply_to_message": {
+                        "message_id": 2844,
+                        "from": {"id": 1001, "first_name": "Topic creator"},
+                        **reply_payload,
+                    },
+                }
+
+                prompt = build_codex_prompt(message_kind, message, {})
+                context = prompt_context(prompt)
+
+                self.assertEqual(context["message_thread_id"], 2844)
+                self.assertEqual(context["reply_to_message"]["message_id"], 2844)
+                self.assertEqual(context["reply_to_message"]["raw_payload"], reply_payload)
+                self.assertNotIn("quoted_original_message", context["reply_to_message"])
+                self.assertEqual(prompt_user_message(prompt), "Follow up")
+                self.assertEqual(prompt_text(prompt).count("forum_topic_created"), 1)
+                self.assertEqual(prompt_text(prompt).count(topic_created["name"]), 1)
+
+    def test_bodyless_reply_payload_is_metadata_without_a_duplicate_json_quote(self) -> None:
+        payloads = (
+            {"forum_topic_closed": {}},
+            {"document": {"file_id": "document-id", "file_name": "report.pdf"}},
+            {"contact": {"first_name": "Other", "phone_number": "+1234567890"}},
+        )
+        for payload in payloads:
+            with self.subTest(payload_kind=next(iter(payload))):
+                message = {
+                    "message_id": 2846,
+                    "text": "Follow up",
+                    "chat": {"id": -1001, "type": "supergroup"},
+                    "reply_to_message": {
+                        "message_id": 2844,
+                        "from": {"id": 1001, "first_name": "Other"},
+                        **payload,
+                    },
+                }
+
+                prompt = build_codex_prompt("message", message, {})
+                reply = prompt_context(prompt)["reply_to_message"]
+
+                self.assertEqual(reply["raw_payload"], payload)
+                self.assertNotIn("quoted_original_message", reply)
+                self.assertEqual(prompt_user_message(prompt), "Follow up")
+
+    def test_structured_reply_metadata_does_not_suppress_a_real_reply_body(self) -> None:
+        bodies = (
+            {"text": "Original body"},
+            {"caption": "Original body"},
+            {"rich_message": {"blocks": [{"type": "paragraph", "text": "Original body"}]}},
+        )
+        for body in bodies:
+            with self.subTest(body_kind=next(iter(body))):
+                message = {
+                    "message_id": 2846,
+                    "text": "Follow up",
+                    "chat": {"id": -1001, "type": "supergroup"},
+                    "reply_to_message": {
+                        "message_id": 2844,
+                        "forum_topic_created": {"name": "Project discussion", "icon_color": 7322096},
+                        "from": {"id": 1001, "first_name": "Topic creator"},
+                        **body,
+                    },
+                }
+
+                prompt = build_codex_prompt("message", message, {})
+
+                self.assertEqual(prompt_user_message(prompt), "> Original body\n\nFollow up")
+
     def test_current_user_text_only_appears_in_user_message(self) -> None:
         user_text = "Unique request text for prompt deduplication"
         message = {
