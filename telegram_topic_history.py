@@ -15,6 +15,11 @@ from typing import Any, Callable
 
 from telegramify_markdown import telegramify_rich
 
+try:
+    from .telegram_math import normalize_math_delimiters
+except ImportError:
+    from telegram_math import normalize_math_delimiters
+
 
 logger = logging.getLogger(__name__)
 _HASH_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
@@ -146,7 +151,7 @@ def normalize_topic_response(text: str | dict[str, Any]) -> str:
         if not isinstance(text, str) or not text.strip():
             return ""
         fragments = []
-        for item in telegramify_rich(text):
+        for item in telegramify_rich(normalize_math_delimiters(text)):
             if isinstance(item, dict):
                 payload = item
             elif hasattr(item, "to_dict"):

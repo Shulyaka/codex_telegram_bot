@@ -40,10 +40,12 @@ from telegramify_markdown import MessageEntity, entities_to_markdownv2, telegram
 
 try:
     from .telegram_entities_to_markdown import entities_to_markdown
+    from .telegram_math import normalize_math_delimiters
     from .telegram_rich_to_markdown import rich_message_to_markdown
     from .telegram_topic_history import TelegramTopicHistory, private_guest_chat_key
 except ImportError:
     from telegram_entities_to_markdown import entities_to_markdown
+    from telegram_math import normalize_math_delimiters
     from telegram_rich_to_markdown import rich_message_to_markdown
     from telegram_topic_history import TelegramTopicHistory, private_guest_chat_key
 
@@ -1046,7 +1048,7 @@ def build_telegram_rich_parts(
     references: list[TelegramRichMediaReference],
     uploaded_file_ids: dict[str, str] | None = None,
 ) -> list[TelegramRichPart]:
-    items = telegramify_rich(markdown)
+    items = telegramify_rich(normalize_math_delimiters(markdown))
     if not items:
         raise ValueError("Telegram rich-message conversion returned no items")
 

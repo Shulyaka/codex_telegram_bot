@@ -270,6 +270,10 @@ and `caption`/`caption_entities` fields are removed as well; an empty `raw_paylo
 user message is converted by the same format-specific path but is not quoted.
 Replies to service messages and other messages without a text, caption, or rich body retain their structured
 metadata once; the bot does not additionally turn that metadata into a synthetic JSON quote.
+Outgoing ordinary and guest responses support native Telegram math with `$...$` and `$$...$$`, as well as
+Codex-style single-line `\(...\)` and display `\[...\]` delimiters. The latter are normalized before
+rich-message conversion; the LaTeX expression is preserved, and examples inside inline or fenced code
+remain literal.
 
 ### Telegram Rich Message conversion
 
