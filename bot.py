@@ -2188,11 +2188,13 @@ class CodexAppServerClient:
         server_request_preparer: Callable[
             [dict[str, Any]], tuple[dict[str, Any], Callable[[], None] | None]
         ] | None = None,
+        thread_is_owned: Callable[[str], bool] | None = None,
     ) -> None:
         self.config = config
         self.notification_handler = notification_handler
         self.server_request_handler = server_request_handler
         self.server_request_preparer = server_request_preparer
+        self.thread_is_owned = thread_is_owned
         self.connection: websocket.WebSocket | None = None
         self.reader_thread: threading.Thread | None = None
         self.lifecycle_lock = threading.RLock()
@@ -2854,6 +2856,16 @@ class CodexAppServerClient:
                 logger.debug("ignored late Codex app-server response id=%s", request_id)
             return
 
+        thread_id = self._message_thread_id(message)
+        if self.thread_is_owned is not None:
+            if thread_id is not None:
+                if not self._owns_thread(thread_id):
+                    return
+            elif self._is_thread_message(message):
+                # Shared-server traffic without a usable thread identity cannot
+                # be attributed to this bot. Global protocol events still pass.
+                return
+
         if request_id is not None and method:
             if method == "item/tool/call" and (
                 self.server_request_handler or self.server_request_preparer
@@ -2907,7 +2919,6 @@ class CodexAppServerClient:
             return
 
         params = message.get("params")
-        thread_id = params.get("threadId") if isinstance(params, dict) else None
         if method == "item/completed" and isinstance(params, dict):
             turn_id = params.get("turnId")
             item = params.get("item")
@@ -2952,7 +2963,39 @@ class CodexAppServerClient:
                     method or "unknown",
                 )
 
+    @staticmethod
+    def _message_thread_id(message: dict[str, Any]) -> str | None:
+        params = message.get("params")
+        if not isinstance(params, dict):
+            return None
+        thread_id = params.get("threadId")
+        if isinstance(thread_id, str) and thread_id:
+            return thread_id
+        thread = params.get("thread")
+        thread_id = thread.get("id") if isinstance(thread, dict) else None
+        return thread_id if isinstance(thread_id, str) and thread_id else None
+
+    @staticmethod
+    def _is_thread_message(message: dict[str, Any]) -> bool:
+        method = message.get("method")
+        if isinstance(method, str) and method.startswith(("thread/", "turn/", "item/")):
+            return True
+        params = message.get("params")
+        return isinstance(params, dict) and any(
+            isinstance(params.get(key), dict) for key in ("thread", "turn", "item")
+        )
+
+    def _owns_thread(self, thread_id: str) -> bool:
+        with self.routing_lock:
+            if self.notification_queues.get(thread_id):
+                return True
+        return self.thread_is_owned is None or self.thread_is_owned(thread_id)
+
     def _handle_server_request(self, request_id: Any, params: Any) -> None:
+        if self.thread_is_owned is not None:
+            thread_id = self._message_thread_id({"params": params})
+            if thread_id is None or not self._owns_thread(thread_id):
+                return
         if not isinstance(params, dict):
             try:
                 self._write_started(
@@ -3478,6 +3521,7 @@ class CodexRunner:
             self._handle_app_server_notification,
             self._handle_dynamic_tool_call if telegram is not None else None,
             server_request_preparer=self._prepare_file_upload if telegram is not None else None,
+            thread_is_owned=self.sessions.has_session,
         )
         self.chat_locks: dict[ConversationKey, threading.RLock] = {}
         self.chat_locks_lock = threading.Lock()

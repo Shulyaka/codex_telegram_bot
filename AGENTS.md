@@ -77,6 +77,9 @@ tool-call status, response readiness, and successful Telegram delivery. Logged t
 potential PAN or credential values are redacted. Raw tool output and hidden model reasoning are not logged.
 Incremental agent-message deltas are logged only at `DEBUG`; completed agent messages remain visible at
 `INFO`.
+Each bot filters thread events and server requests to its stored Codex sessions and active operations before
+logging or handling them. Events from unrelated threads on the shared app-server are ignored, including tool
+and user-input requests that belong to another client. Global app-server warnings remain visible.
 The `httpx` and `httpcore` transport loggers are held at `WARNING` so routine request lines do not expose the
 Telegram bot token embedded in Bot API URLs, even when the bot's own log level is `DEBUG`.
 
