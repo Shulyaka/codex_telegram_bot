@@ -28,9 +28,38 @@ def _valid_chat_id(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _scope(kind: str, chat_id: int) -> str:
+def private_guest_chat_key(message: dict[str, Any]) -> str | None:
+    chat = message.get("chat")
+    sender = message.get("from")
+    if not isinstance(chat, dict) or chat.get("type") != "private" or not isinstance(sender, dict):
+        return None
+    chat_id = chat.get("id")
+    sender_id = sender.get("id")
+    if not _valid_id(chat_id) or not _valid_id(sender_id) or chat_id == sender_id:
+        return None
+    first, second = sorted((chat_id, sender_id))
+    return f"guest:private:{first}:{second}"
+
+
+def _scope(kind: str, chat_id: int, message: dict[str, Any]) -> str:
+    if kind == "guest_message":
+        private_key = private_guest_chat_key(message)
+        if private_key is not None:
+            return f"{private_key}:view:{chat_id}"
     namespace = "guest" if kind == "guest_message" else "ordinary"
     return f"{namespace}:{chat_id}"
+
+
+def _valid_scope(scope: Any) -> bool:
+    if not isinstance(scope, str):
+        return False
+    if re.fullmatch(r"(?:ordinary|guest):-?\d+", scope):
+        return True
+    match = re.fullmatch(r"guest:private:([1-9]\d*):([1-9]\d*):view:([1-9]\d*)", scope)
+    if match is None:
+        return False
+    first, second, view = map(int, match.groups())
+    return first < second and view in {first, second}
 
 
 class _RichHTMLText(HTMLParser):
@@ -160,7 +189,7 @@ class TelegramTopicHistory:
         chat_id = chat.get("id") if isinstance(chat, dict) else None
         if not _valid_chat_id(chat_id):
             return normalized
-        scope = _scope(kind, chat_id)
+        scope = _scope(kind, chat_id, normalized)
         current_id = normalized.get("message_id")
         explicit = normalized.get("message_thread_id")
         if normalized.get("is_topic_message") is False:
@@ -224,7 +253,7 @@ class TelegramTopicHistory:
         if message.get("is_topic_message") is False or not _valid_id(topic):
             topic = 0
         with self.lock:
-            scope = _scope(kind, chat_id)
+            scope = _scope(kind, chat_id, message)
             if topic:
                 self._record_message(scope, message_id, topic)
             self._record_response(scope, text, topic)
@@ -294,7 +323,7 @@ class TelegramTopicHistory:
             raise ValueError(f"invalid Telegram topic history {self.path}")
         scopes = {}
         for scope, data in payload["scopes"].items():
-            if not isinstance(scope, str) or not re.fullmatch(r"(?:ordinary|guest):-?\d+", scope) or not isinstance(data, dict):
+            if not _valid_scope(scope) or not isinstance(data, dict):
                 raise ValueError(f"invalid Telegram topic history scope in {self.path}")
             loaded = {}
             for category in ("messages", "responses"):

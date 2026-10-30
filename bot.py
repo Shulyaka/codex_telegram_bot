@@ -41,11 +41,11 @@ from telegramify_markdown import MessageEntity, entities_to_markdownv2, telegram
 try:
     from .telegram_entities_to_markdown import entities_to_markdown
     from .telegram_rich_to_markdown import rich_message_to_markdown
-    from .telegram_topic_history import TelegramTopicHistory
+    from .telegram_topic_history import TelegramTopicHistory, private_guest_chat_key
 except ImportError:
     from telegram_entities_to_markdown import entities_to_markdown
     from telegram_rich_to_markdown import rich_message_to_markdown
-    from telegram_topic_history import TelegramTopicHistory
+    from telegram_topic_history import TelegramTopicHistory, private_guest_chat_key
 
 
 logger = logging.getLogger(__name__)
@@ -355,6 +355,21 @@ def telegram_conversation_key(
     return chat_id
 
 
+def telegram_message_conversation_key(
+    kind: str,
+    message: dict[str, Any],
+) -> ConversationKey:
+    chat = message.get("chat")
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    if not isinstance(chat_id, int) or isinstance(chat_id, bool):
+        raise ValueError("The Telegram message has no valid numeric chat ID.")
+    topic_id = message.get("message_thread_id")
+    private_guest_key = private_guest_chat_key(message) if kind == "guest_message" else None
+    if private_guest_key is not None:
+        return f"{private_guest_key}:{topic_id}" if valid_message_thread_id(topic_id) else private_guest_key
+    return telegram_conversation_key(kind, chat_id, topic_id)
+
+
 def added_telegram_reaction_text(
     old_reactions: Any,
     new_reactions: Any,
@@ -565,6 +580,28 @@ def parsed_conversation_key(
     encoded = conversation_key.removeprefix(
         GUEST_CONVERSATION_PREFIX if is_guest else TOPIC_CONVERSATION_PREFIX,
     )
+    if is_guest and encoded.startswith("private:"):
+        parts = encoded.split(":")
+        if len(parts) not in {3, 4}:
+            raise ValueError(f"invalid Telegram conversation key {conversation_key!r}")
+        try:
+            first_id, second_id = int(parts[1]), int(parts[2])
+            topic_id = int(parts[3]) if len(parts) == 4 else None
+        except ValueError as err:
+            raise ValueError(f"invalid Telegram conversation key {conversation_key!r}") from err
+        if (
+            first_id <= 0
+            or second_id <= first_id
+            or parts[1:3] != [str(first_id), str(second_id)]
+            or (topic_id is not None and (
+                not valid_message_thread_id(topic_id) or parts[3] != str(topic_id)
+            ))
+        ):
+            raise ValueError(f"invalid Telegram conversation key {conversation_key!r}")
+        # A private guest has no single directional Telegram chat ID. This
+        # representative is used only for existing private/group classification;
+        # guest replies use their original message and guest_query_id.
+        return first_id, topic_id, True
     chat_id_text, separator, message_thread_id_text = encoded.partition(":")
     try:
         chat_id = int(chat_id_text)
@@ -4875,6 +4912,10 @@ class ConversationController:
             self._process_guest_deadline(payload)
 
     def _process_incoming(self, kind: str, message: dict[str, Any]) -> None:
+        if kind == "guest_message":
+            chat_id = message.get("chat", {}).get("id")
+            if isinstance(chat_id, int) and not isinstance(chat_id, bool):
+                self.chat_id = chat_id
         command = telegram_session_command(message, self.bot.bot_user) if kind == "message" else None
         if command:
             if self.active_turn is not None:
@@ -5581,11 +5622,7 @@ class Bot:
         if not isinstance(chat_id, int):
             logger.info("ignored update %s: no numeric chat id", update.get("update_id"))
             return
-        conversation_key = telegram_conversation_key(
-            kind,
-            chat_id,
-            message.get("message_thread_id"),
-        )
+        conversation_key = telegram_message_conversation_key(kind, message)
         with self.controllers_lock:
             controller = self.controllers.get(conversation_key)
             if controller is None:
@@ -6020,10 +6057,7 @@ class Bot:
             message.get("chat", {}).get("id"),
         )
         chat_id = message["chat"]["id"]
-        conversation_key = guest_conversation_key(
-            chat_id,
-            message.get("message_thread_id"),
-        )
+        conversation_key = telegram_message_conversation_key("guest_message", message)
         previous_response_error = self.codex.previous_response_error(conversation_key)
         if not isinstance(previous_response_error, str):
             previous_response_error = None
@@ -6956,6 +6990,9 @@ def telegram_thread_key(message: dict[str, Any]) -> str:
     chat_id = message.get("chat", {}).get("id", "unknown")
     message_thread_id = message.get("message_thread_id")
     thread_id = message_thread_id if message_thread_id is not None else "main"
+    private_guest_key = private_guest_chat_key(message) if message.get("guest_query_id") else None
+    if private_guest_key is not None:
+        return f"{private_guest_key.replace(':', '-')}-thread-{thread_id}"
     return f"chat-{chat_id}-thread-{thread_id}"
 
 

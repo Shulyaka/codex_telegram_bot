@@ -3,6 +3,8 @@
 Small long-polling Telegram bot that forwards messages and attachments from allow-listed Telegram chats and users to Codex.
 Each ordinary bot chat or forum topic has its own persistent Codex session history. Guest invocations use a separate
 guest-chat namespace because Telegram guest chat IDs can collide with ordinary bot chat IDs.
+Private guest conversations use the sorted pair of participant user IDs, so both directions of a
+user-to-user chat share one Codex history while chats with different participants stay separate.
 For ordinary messages, it streams every completed Codex agent message back as a Telegram Rich Message.
 Guest bot invocations are handled through Telegram's `guest_message` updates and `answerGuestQuery`,
 which permits one response for each guest query.
@@ -160,6 +162,8 @@ to the current bot can also be matched against a previously delivered response u
 complete body with presentation formatting normalized. Guest and ordinary histories are separate, and matches
 are scoped to the Telegram chat. Responses seen in multiple topics, or with an unknown topic, are ambiguous
 and do not select a topic. Explicit non-topic messages do not acquire a topic through inference.
+For private guest chats, topic-recovery records include both participants and retain the original Telegram
+chat-ID view, so message IDs from different conversations or participant views do not collide.
 The topic-history file stores message IDs, topic IDs, and response fingerprints rather than message bodies.
 It survives restarts and Codex thread archival. Recovering a topic happens before session routing, attachment
 handling, and prompt construction; the resolved ID is included as top-level `message_thread_id` in
@@ -168,6 +172,9 @@ handling, and prompt construction; the resolved ID is included as top-level `mes
 Topic recovery learns from live Telegram messages and successful bot deliveries. An older reply without
 enough evidence can remain chat-wide until a later message supplies the topic ID or its creation header.
 Copy the topic-history file together with the session store when moving the bot's runtime data.
+Older private guest session keys containing only one user ID remain saved for manual recovery. When both
+participants are known, the bot starts a shared pair-specific session rather than guessing which old history
+belongs to that pair. Missing participant metadata retains the legacy guest chat-ID fallback.
 New Codex threads receive a user-facing name immediately after creation. Group and supergroup threads use
 the Telegram chat title, followed by the numeric topic ID for forum topics. Direct user-to-bot threads use
 `@username` when available or the Telegram
@@ -326,7 +333,8 @@ When an allowed user mentions the bot as a guest, or the mention occurs in an al
 - includes the asking user and replied-to message in the prompt sent to Codex;
 - creates or resumes the Codex session assigned to that guest chat, independently of any ordinary bot chat
   with the same numeric ID; both participants in the same guest chat share that guest session, and guest
-  group chats use the same separate guest namespace even though their Telegram IDs are negative;
+  private chats use a canonical pair of numeric user IDs rather than the sender-dependent chat ID;
+  guest group chats use the same separate guest namespace even though their Telegram IDs are negative;
 - sends the response through `answerGuestQuery`.
 
 Guest replies are limited to one Telegram guest response.

@@ -4139,7 +4139,7 @@ class ConversationControllerTest(unittest.TestCase):
                     "message_id": 2,
                     "guest_query_id": "guest-query",
                     "text": "guest",
-                    "from": {"id": 1001},
+                    "from": {"id": 1002},
                     "chat": {"id": 1001, "type": "private"},
                 },
             }
@@ -4147,7 +4147,7 @@ class ConversationControllerTest(unittest.TestCase):
             bot.dispatch_update(ordinary_update)
             bot.dispatch_update(guest_update)
 
-            guest_key = telegram_conversation_key("guest_message", 1001)
+            guest_key = "guest:private:1001:1002"
             self.assertEqual(set(bot.controllers), {1001, guest_key})
             self.assertIsNot(bot.controllers[1001], bot.controllers[guest_key])
             self.assertEqual(bot.controllers[guest_key].chat_id, 1001)
@@ -4159,8 +4159,8 @@ class ConversationControllerTest(unittest.TestCase):
                     "message_id": 3,
                     "guest_query_id": "second-guest-query",
                     "text": "guest from the other participant",
-                    "from": {"id": 1002},
-                    "chat": {"id": 1001, "type": "private"},
+                    "from": {"id": 1001},
+                    "chat": {"id": 1002, "type": "private"},
                 },
             }
             shared_guest_controller = bot.controllers[guest_key]

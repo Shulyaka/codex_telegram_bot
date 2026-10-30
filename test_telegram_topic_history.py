@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from telegram_topic_history import TelegramTopicHistory, normalize_topic_response
+from telegram_topic_history import TelegramTopicHistory, normalize_topic_response, private_guest_chat_key
 
 class TelegramTopicHistoryTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -29,6 +29,105 @@ class TelegramTopicHistoryTests(unittest.TestCase):
         reply = {"message_id": message_id, "from": self.bot, "text": text}
         reply.update(fields)
         return reply
+
+    def private_message(self, sender: int, peer: int, message_id: int = 100, topic: int | None = None, **fields) -> dict:
+        message = self.message(message_id, topic, chat={"id": peer, "type": "private"})
+        message["from"] = {"id": sender}
+        message.update(fields)
+        return message
+
+    def test_private_guest_chat_key_is_shared_by_both_participants(self) -> None:
+        self.assertEqual(private_guest_chat_key(self.private_message(1001, 2002)), "guest:private:1001:2002")
+        self.assertEqual(private_guest_chat_key(self.private_message(2002, 1001)), "guest:private:1001:2002")
+        invalid_messages = (
+            self.message(**{"from": {"id": 1001}}),
+            self.private_message(1001, 1001),
+            self.private_message(True, 2002),
+            self.private_message(1001, True),
+            self.private_message(0, 2002),
+            self.private_message(1001, -2002),
+            self.private_message("1001", 2002),
+            {"chat": {"id": 2002, "type": "private"}, "from": {"username": "sender"}, "reply_to_message": {"from": {"id": 1001}}},
+            {"from": {"id": 1001}},
+        )
+        for message in invalid_messages:
+            with self.subTest(message=message):
+                self.assertIsNone(private_guest_chat_key(message))
+
+    def test_private_guest_senders_sharing_a_peer_have_separate_persisted_evidence(self) -> None:
+        for sender, topic in ((1001, 42), (3003, 81)):
+            message = self.private_message(sender, 2002, topic=topic)
+            self.history.resolve("guest_message", message, self.bot)
+            self.history.record_response("guest_message", message, "Same answer")
+        reloaded = TelegramTopicHistory(self.path)
+
+        for sender, topic in ((1001, 42), (3003, 81)):
+            with self.subTest(sender=sender):
+                by_id = reloaded.resolve(
+                    "guest_message", self.private_message(sender, 2002, 101, reply_to_message=self.reply(100)), self.bot,
+                )
+                by_body = reloaded.resolve(
+                    "guest_message", self.private_message(sender, 2002, 201, reply_to_message=self.reply(200, "Same answer")), self.bot,
+                )
+                self.assertEqual(by_id["message_thread_id"], topic)
+                self.assertEqual(by_body["message_thread_id"], topic)
+        self.assertEqual(
+            set(json.loads(self.path.read_text(encoding="utf-8"))["scopes"]),
+            {"guest:private:1001:2002:view:2002", "guest:private:2002:3003:view:2002"},
+        )
+
+    def test_private_guest_reverse_views_keep_numeric_ids_and_fingerprints_separate(self) -> None:
+        for sender, peer, topic in ((1001, 2002, 42), (2002, 1001, 81)):
+            message = self.private_message(sender, peer, topic=topic)
+            self.history.resolve("guest_message", message, self.bot)
+            self.history.record_response("guest_message", message, "Same answer")
+        reloaded = TelegramTopicHistory(self.path)
+
+        for sender, peer, topic in ((1001, 2002, 42), (2002, 1001, 81)):
+            with self.subTest(sender=sender):
+                by_id = reloaded.resolve(
+                    "guest_message", self.private_message(sender, peer, 101, reply_to_message=self.reply(100)), self.bot,
+                )
+                by_body = reloaded.resolve(
+                    "guest_message", self.private_message(sender, peer, 201, reply_to_message=self.reply(200, "Same answer")), self.bot,
+                )
+                self.assertEqual(by_id["message_thread_id"], topic)
+                self.assertEqual(by_body["message_thread_id"], topic)
+
+    def test_private_guest_pair_has_no_legacy_scope_alias_and_other_scopes_stay_unchanged(self) -> None:
+        legacy = {"message_id": 100, "chat": {"id": 2002, "type": "private"}, "message_thread_id": 42}
+        self.history.record_response("guest_message", legacy, "Known answer", 99)
+        ordinary = self.private_message(1001, 2002, topic=81)
+        self.history.record_response("message", ordinary, "Known answer", 99)
+        self.history.record_response("guest_message", self.message(topic=123), "Known answer", 99)
+        reloaded = TelegramTopicHistory(self.path)
+
+        paired = reloaded.resolve(
+            "guest_message", self.private_message(1001, 2002, reply_to_message=self.reply()), self.bot,
+        )
+        self.assertNotIn("message_thread_id", paired)
+        without_sender = reloaded.resolve(
+            "guest_message", {"chat": legacy["chat"], "reply_to_message": self.reply()}, self.bot,
+        )
+        self.assertEqual(without_sender["message_thread_id"], 42)
+        ordinary_reply = reloaded.resolve(
+            "message", self.private_message(1001, 2002, reply_to_message=self.reply()), self.bot,
+        )
+        self.assertEqual(ordinary_reply["message_thread_id"], 81)
+        group_reply = reloaded.resolve("guest_message", self.message(reply_to_message=self.reply()), self.bot)
+        self.assertEqual(group_reply["message_thread_id"], 123)
+
+    def test_invalid_private_guest_persistence_scope_is_rejected(self) -> None:
+        for scope in (
+            "guest:private:2002:1001:view:2002",
+            "guest:private:1001:1001:view:1001",
+            "guest:private:0:2002:view:2002",
+            "guest:private:1001:2002:view:3003",
+        ):
+            with self.subTest(scope=scope):
+                self.path.write_text(json.dumps({"version": 1, "scopes": {scope: {"messages": {}, "responses": {}}}}), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    TelegramTopicHistory(self.path)
 
     def test_explicit_topic_is_copied_and_recovered_after_restart(self) -> None:
         original = self.message(topic=42)
