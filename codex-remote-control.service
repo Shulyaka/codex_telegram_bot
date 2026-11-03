@@ -1,0 +1,13 @@
+[Unit]
+Description=Codex remote control bridge
+
+[Service]
+Type=forking
+GuessMainPID=yes
+WorkingDirectory=%h
+#ExecStartPre=%h/.local/bin/codex update
+ExecStart=%h/.local/bin/codex remote-control start
+ExecStop=%h/.local/bin/codex remote-control stop
+
+[Install]
+WantedBy=default.target
