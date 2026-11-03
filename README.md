@@ -3,7 +3,7 @@
 Forwards Telegram messages and attachments to Codex and sends back its replies.
 Each chat or forum topic keeps its own persistent conversation history.
 
-100% vibe codedd.
+100% vibe coded.
 
 Requires Python 3.10+ and an installed, authenticated Codex CLI. Run from this directory:
 
