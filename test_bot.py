@@ -2905,7 +2905,7 @@ class CodexRunnerTest(unittest.TestCase):
         )
         self.assertNotEqual(sticker_spec["description"], guest_sticker_spec["description"])
 
-    def test_guest_thread_registers_commentary_reaction_tool(self) -> None:
+    def test_guest_thread_starts_with_fast_tier_and_commentary_reaction_tool(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             telegram = MagicMock()
             runner = CodexRunner(build_config(Path(temp_dir)), telegram)
@@ -2920,8 +2920,8 @@ class CodexRunnerTest(unittest.TestCase):
 
         runner.client.start_thread.assert_has_calls(
             [
-                call(telegram_dynamic_tool_specs()),
-                call([telegram_reaction_tool_spec(guest_mode=True)]),
+                call(telegram_dynamic_tool_specs(), service_tier=None),
+                call([telegram_reaction_tool_spec(guest_mode=True)], service_tier="fast"),
             ],
         )
 
@@ -3513,7 +3513,6 @@ class CodexRunnerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             config = build_config(Path(temp_dir))
             steps: list[str] = []
-            session_ids = iter(("session-one", "session-two"))
 
             def pull_git_repositories(repo_dir: Path, timeout: int) -> list[tuple[Path, str]]:
                 steps.append("pull")
@@ -3530,9 +3529,9 @@ class CodexRunnerTest(unittest.TestCase):
                 runner = CodexRunner(config)
                 runner.client = MagicMock()
                 runner.client.generation = 1
-                runner.client.start_thread.side_effect = lambda: next(session_ids)
+                runner.client.start_thread.side_effect = ["session-one", "session-two"]
                 runner.client.run_turn.side_effect = run_turn
-                runner.run(-1001, "first", fast_mode=True)
+                runner.run(-1001, "first")
                 runner.run(-1001, "second")
                 runner.run(-1002, "other chat")
                 self.assertTrue(runner.git_puller.wait(1))
@@ -3549,7 +3548,6 @@ class CodexRunnerTest(unittest.TestCase):
                 "session-one",
                 "session-two",
             ])
-            self.assertEqual([call.args[4] for call in turn_calls], [True, False, False])
 
             sessions = SessionStore(config.session_store_path)
             self.assertEqual(sessions.get(-1001), "session-one")
@@ -3670,13 +3668,12 @@ class CodexRunnerTest(unittest.TestCase):
 
             self.assertEqual(runner.sessions.get(-1001), "new-session")
             runner.client.resume_thread.assert_called_once_with("missing-session")
-            runner.client.start_thread.assert_called_once_with()
+            runner.client.start_thread.assert_called_once_with(None, service_tier=None)
             runner.client.run_turn.assert_called_once_with(
                 "new-session",
                 "prompt",
                 None,
                 None,
-                False,
             )
 
     def test_archived_thread_during_turn_start_creates_a_new_session_and_retries(self) -> None:
@@ -3743,7 +3740,7 @@ class CodexRunnerTest(unittest.TestCase):
             self.assertEqual(runner.run(1001, "first"), "response")
             self.assertEqual(runner.run(1001, "second"), "response")
 
-            runner.client.start_thread.assert_called_once_with()
+            runner.client.start_thread.assert_called_once_with(None, service_tier=None)
             runner.client.resume_thread.assert_called_once_with("private-session")
             self.assertEqual(
                 runner.client.unsubscribe_thread.call_args_list,
@@ -3935,7 +3932,6 @@ class ConversationControllerTest(unittest.TestCase):
             bot.codex.steer_turn.assert_called_once()
             self.assertIs(bot.codex.steer_turn.call_args.args[0], running_turn)
             self.assertEqual(controller.target.message["message_id"], 1)
-            self.assertFalse(bot.codex.begin_turn.call_args.kwargs["fast_mode"])
             self.assertEqual(
                 bot.codex.begin_turn.call_args.kwargs["thread_name"],
                 "Telegram chat -1001",
@@ -4075,7 +4071,6 @@ class ConversationControllerTest(unittest.TestCase):
 
             bot.codex.begin_turn.assert_called_once()
             self.assertEqual(bot.codex.begin_turn.call_args.args[0], conversation_key)
-            self.assertFalse(bot.codex.begin_turn.call_args.kwargs["fast_mode"])
             self.assertEqual(bot.codex.begin_turn.call_args.kwargs["message_thread_id"], 42)
             self.assertTrue(
                 callable(
@@ -5103,6 +5098,21 @@ class CodexProgressLoggingTest(unittest.TestCase):
                         )
                     self.assertEqual(start_params["threadSource"], "codex_telegram_bot")
                     self.assertEqual(resume_params["threadId"], "thread-one")
+                    self.assertNotIn("serviceTier", start_params)
+                    self.assertNotIn("serviceTier", resume_params)
+
+    def test_thread_service_tier_is_sent_on_creation_only(self) -> None:
+        client = CodexAppServerClient(build_config(Path("/repo")))
+        client.request = MagicMock(return_value={"thread": {"id": "thread-one"}})
+
+        self.assertEqual(client.start_thread(service_tier="fast"), "thread-one")
+        client.resume_thread("thread-one")
+
+        start_call, resume_call = client.request.call_args_list
+        self.assertEqual(start_call.args[0], "thread/start")
+        self.assertEqual(start_call.args[1]["serviceTier"], "fast")
+        self.assertEqual(resume_call.args[0], "thread/resume")
+        self.assertNotIn("serviceTier", resume_call.args[1])
 
     def test_unconfigured_instructions_omit_override_without_warning(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5547,7 +5557,7 @@ class CodexProgressLoggingTest(unittest.TestCase):
         self.assertEqual(message, "agentMessage completed: Checking the implementation.")
         self.assertEqual(tool, "tool started: oracle.query")
 
-    def test_app_server_turn_forwards_messages_and_uses_fast_tier_and_local_images(self) -> None:
+    def test_app_server_turn_forwards_messages_and_local_images(self) -> None:
         client = CodexAppServerClient(build_config(Path("/repo")))
         client.start = MagicMock()
         messages: list[str] = []
@@ -5602,13 +5612,11 @@ class CodexProgressLoggingTest(unittest.TestCase):
             ["<telegram_context>\n{}\n</telegram_context>", "Inspect this"],
             [Path("/repo/image.png")],
             messages.append,
-            True,
         )
 
         self.assertEqual(response, "Final answer.")
         self.assertEqual(messages, ["Progress update.", "Final answer."])
         params = requests[0][1]
-        self.assertEqual(params["serviceTier"], "fast")
         self.assertEqual(
             params["input"],
             [
@@ -5621,52 +5629,30 @@ class CodexProgressLoggingTest(unittest.TestCase):
             ],
         )
 
-    def test_turn_start_uses_configured_permissions_for_ordinary_and_guest_turns(self) -> None:
+    def test_turn_start_uses_configured_permissions_and_omits_service_tier(self) -> None:
         for read_only in (True, False):
-            for fast_mode in (False, True):
-                with self.subTest(read_only=read_only, guest=fast_mode):
-                    client = CodexAppServerClient(
-                        build_config(Path("/repo"), read_only=read_only),
-                    )
-                    client.start = MagicMock()
-                    client.request = MagicMock(return_value={"turn": {"id": "turn-one"}})
+            with self.subTest(read_only=read_only):
+                client = CodexAppServerClient(
+                    build_config(Path("/repo"), read_only=read_only),
+                )
+                client.start = MagicMock()
+                client.request = MagicMock(return_value={"turn": {"id": "turn-one"}})
 
-                    client.start_turn("thread-one", "hello", [], None, fast_mode)
+                client.start_turn("thread-one", "hello", [], None)
 
-                    method, params = client.request.call_args.args
-                    self.assertEqual(method, "turn/start")
-                    self.assertEqual(params["threadId"], "thread-one")
-                    self.assertEqual(params["cwd"], "/repo")
-                    self.assertEqual(params["serviceTier"], "fast" if fast_mode else None)
-                    if read_only:
-                        self.assertEqual(params["approvalPolicy"], "never")
-                        self.assertEqual(params["sandboxPolicy"], {"type": "readOnly"})
-                        self.assertNotIn("approvalsReviewer", params)
-                    else:
-                        self.assertEqual(params["approvalPolicy"], "on-request")
-                        self.assertEqual(params["approvalsReviewer"], "auto_review")
-                        self.assertNotIn("sandboxPolicy", params)
-
-    def test_normal_turn_explicitly_clears_fast_tier(self) -> None:
-        client = CodexAppServerClient(build_config(Path("/repo")))
-        client.start = MagicMock()
-        event_queue: queue.Queue[object] = queue.Queue()
-        client._register_notification_queue = MagicMock(return_value=event_queue)
-        client._unregister_notification_queue = MagicMock()
-        client.request = MagicMock(return_value={"turn": {"id": "turn-one"}})
-        event_queue.put(
-            {
-                "method": "turn/completed",
-                "params": {
-                    "threadId": "thread-one",
-                    "turn": {"id": "turn-one", "status": "completed"},
-                },
-            },
-        )
-
-        client.run_turn("thread-one", "hello", [], None, False)
-
-        self.assertIsNone(client.request.call_args.args[1]["serviceTier"])
+                method, params = client.request.call_args.args
+                self.assertEqual(method, "turn/start")
+                self.assertEqual(params["threadId"], "thread-one")
+                self.assertEqual(params["cwd"], "/repo")
+                self.assertNotIn("serviceTier", params)
+                if read_only:
+                    self.assertEqual(params["approvalPolicy"], "never")
+                    self.assertEqual(params["sandboxPolicy"], {"type": "readOnly"})
+                    self.assertNotIn("approvalsReviewer", params)
+                else:
+                    self.assertEqual(params["approvalPolicy"], "on-request")
+                    self.assertEqual(params["approvalsReviewer"], "auto_review")
+                    self.assertNotIn("sandboxPolicy", params)
 
     def test_app_server_steer_targets_the_active_turn_without_turn_overrides(self) -> None:
         client = CodexAppServerClient(build_config(Path("/repo")))
@@ -5738,7 +5724,7 @@ class CodexProgressLoggingTest(unittest.TestCase):
             ),
         )
         self.assertNotIn("agent_message_handler", bot.codex.run.call_args.kwargs)
-        self.assertTrue(bot.codex.run.call_args.kwargs["fast_mode"])
+        self.assertEqual(bot.codex.run.call_args.args[0], guest_conversation_key(-1001))
 
     def test_guest_deadline_warning_uses_the_only_response_and_keeps_final_in_thread(self) -> None:
         class ImmediateTimer:
@@ -5863,7 +5849,6 @@ class CodexProgressLoggingTest(unittest.TestCase):
         )
         self.assertEqual(bot.telegram.send_rich_message.call_args.args[2], 2398)
         bot.codex.record_bot_message.assert_called_once_with(-1001, 3002)
-        self.assertNotIn("fast_mode", bot.codex.run.call_args.kwargs)
 
     def test_archive_command_resets_conversation_without_starting_a_turn(self) -> None:
         bot = object.__new__(Bot)
@@ -6085,7 +6070,6 @@ class CodexProgressLoggingTest(unittest.TestCase):
                 prompt: object,
                 image_paths: list[Path],
                 agent_message_handler: Callable[[str], None],
-                fast_mode: bool,
             ) -> str:
                 agent_message_handler("Working on it.")
                 agent_message_handler("Final answer.")

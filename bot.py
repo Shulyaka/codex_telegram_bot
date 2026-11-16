@@ -2367,9 +2367,16 @@ class CodexAppServerClient:
         )
         self.reader_thread.start()
 
-    def start_thread(self, dynamic_tools: list[dict[str, Any]] | None = None) -> str:
+    def start_thread(
+        self,
+        dynamic_tools: list[dict[str, Any]] | None = None,
+        *,
+        service_tier: str | None = None,
+    ) -> str:
         params = self._thread_configuration(dynamic_tools)
         params["threadSource"] = "codex_telegram_bot"
+        if service_tier is not None:
+            params["serviceTier"] = service_tier
         result = self.request(
             "thread/start",
             params,
@@ -2444,7 +2451,6 @@ class CodexAppServerClient:
         prompt: str | list[str],
         image_paths: list[Path] | None,
         agent_message_handler: Callable[[str], None] | None,
-        fast_mode: bool,
     ) -> str:
         structured_handler = (
             (lambda message: agent_message_handler(message.text))
@@ -2456,7 +2462,6 @@ class CodexAppServerClient:
             prompt,
             image_paths,
             structured_handler,
-            fast_mode,
         )
         return self.wait_turn(handle)
 
@@ -2466,7 +2471,6 @@ class CodexAppServerClient:
         prompt: str | list[str],
         image_paths: list[Path] | None,
         agent_message_handler: Callable[[CodexAgentMessage], None] | None,
-        fast_mode: bool,
         generated_image_handler: Callable[[CodexGeneratedImage], None] | None = None,
         image_generation_started_handler: Callable[[], None] | None = None,
     ) -> CodexTurnHandle:
@@ -2477,7 +2481,6 @@ class CodexAppServerClient:
                 "input": self._turn_inputs(prompt, image_paths),
                 "cwd": str(self.config.repo_dir),
                 "approvalPolicy": "never" if self.config.read_only else "on-request",
-                "serviceTier": "fast" if fast_mode else None,
             }
             if self.config.read_only:
                 params["sandboxPolicy"] = {"type": "readOnly"}
@@ -3669,7 +3672,6 @@ class CodexRunner:
         prompt: str | list[str] | Callable[[SessionRecord | None], str | list[str]],
         image_paths: list[Path] | None = None,
         agent_message_handler: Callable[[str], None] | None = None,
-        fast_mode: bool = False,
         thread_name: str | None = None,
     ) -> str:
         self.git_puller.start_if_due()
@@ -3686,7 +3688,6 @@ class CodexRunner:
                     prompt,
                     image_paths,
                     agent_message_handler,
-                    fast_mode,
                     message_at,
                     thread_name,
                 )
@@ -3702,7 +3703,6 @@ class CodexRunner:
         prompt: str | list[str] | Callable[[SessionRecord | None], str | list[str]],
         image_paths: list[Path] | None = None,
         agent_message_handler: Callable[[CodexAgentMessage], None] | None = None,
-        fast_mode: bool = False,
         generated_image_handler: Callable[[CodexGeneratedImage], None] | None = None,
         thread_name: str | None = None,
         message_thread_id: int | None = None,
@@ -3727,7 +3727,6 @@ class CodexRunner:
                         resolve_session_prompt(prompt, record),
                         image_paths,
                         agent_message_handler,
-                        fast_mode,
                         generated_image_handler,
                         image_generation_started_handler,
                     )
@@ -3756,7 +3755,6 @@ class CodexRunner:
                     resolve_session_prompt(prompt, None),
                     image_paths,
                     agent_message_handler,
-                    fast_mode,
                     generated_image_handler,
                     image_generation_started_handler,
                 )
@@ -4031,7 +4029,6 @@ class CodexRunner:
         prompt: str | list[str] | Callable[[SessionRecord | None], str | list[str]],
         image_paths: list[Path] | None,
         agent_message_handler: Callable[[str], None] | None,
-        fast_mode: bool,
         message_at: float,
         thread_name: str | None,
     ) -> str:
@@ -4047,7 +4044,6 @@ class CodexRunner:
                     resolve_session_prompt(prompt, record),
                     image_paths,
                     agent_message_handler,
-                    fast_mode,
                 )
                 self.sessions.clear_response_error(chat_id)
                 return response
@@ -4063,7 +4059,6 @@ class CodexRunner:
             resolve_session_prompt(prompt, None),
             image_paths,
             agent_message_handler,
-            fast_mode,
         )
         self.sessions.clear_response_error(chat_id)
         return response
@@ -4214,10 +4209,8 @@ class CodexRunner:
         thread_name: str | None = None,
     ) -> str:
         dynamic_tools = self._dynamic_tools_for_chat(chat_id)
-        if dynamic_tools is None:
-            thread_id = self.client.start_thread()
-        else:
-            thread_id = self.client.start_thread(dynamic_tools)
+        service_tier = "fast" if is_guest_conversation_key(chat_id) else None
+        thread_id = self.client.start_thread(dynamic_tools, service_tier=service_tier)
         if thread_name:
             try:
                 self.client.set_thread_name(thread_id, thread_name)
@@ -5093,7 +5086,6 @@ class ConversationController:
                 prepared.prompt,
                 prepared.image_paths,
                 agent_message_handler=lambda message: self.enqueue("agent_message", message),
-                fast_mode=prepared.kind == "guest_message",
                 generated_image_handler=lambda image: self.enqueue("generated_image", image),
                 thread_name=telegram_thread_name(prepared.kind, prepared.message),
                 message_thread_id=prepared.message.get("message_thread_id"),
@@ -6218,7 +6210,6 @@ class Bot:
                 conversation_key,
                 build_prompt,
                 image_paths,
-                fast_mode=True,
                 thread_name=telegram_thread_name("guest_message", message),
             )
             codex_succeeded = True

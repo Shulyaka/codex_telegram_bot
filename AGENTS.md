@@ -351,7 +351,8 @@ When an allowed user mentions the bot as a guest, or the mention occurs in an al
 - sends the response through `answerGuestQuery`.
 
 Guest replies are limited to one Telegram guest response.
-Guest Codex turns temporarily request the Fast service tier to help meet Telegram's response deadline.
+New guest Codex threads request the Fast service tier to help meet Telegram's response deadline.
+The bot leaves the service tier to Codex when starting an ordinary thread, resuming a thread, or starting a turn.
 Completed commentary is retained while a guest turn runs. When another guest message steers the same active
 turn, any commentary accumulated so far is concatenated and used as the previous unanswered guest query's one
 response, provided that query is still accepted by Telegram. The new guest query becomes the target for the
