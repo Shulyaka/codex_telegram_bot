@@ -63,7 +63,7 @@ DEFAULT_SESSION_MAINTENANCE_TIMEOUT_SECONDS = 10 * 60
 DEFAULT_GIT_PULL_INTERVAL_SECONDS = 5 * 60
 DEFAULT_GUEST_RESPONSE_WARNING_SECONDS = 4 * 60 + 50
 DEFAULT_MAX_CONCURRENT_CHATS = 16
-TELEGRAM_REQUEST_ATTEMPTS = 4
+DEFAULT_TELEGRAM_REQUEST_ATTEMPTS = 4
 TELEGRAM_NETWORK_RETRY_DELAY_SECONDS = 0.5
 MAX_TELEGRAM_RICH_MEDIA = 50
 MAX_TELEGRAM_PHOTO_BYTES = 10 * 1024 * 1024
@@ -149,6 +149,7 @@ class Config:
     read_only: bool = True
     instructions_file: Path | None = None
     upload_dir: Path | None = None
+    telegram_request_attempts: int = DEFAULT_TELEGRAM_REQUEST_ATTEMPTS
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -190,6 +191,10 @@ class Config:
                 os.environ.get("CODEX_TELEGRAM_SESSION_STORE", default_session_store_path(repo_dir)),
             ).expanduser().resolve(),
             poll_timeout_seconds=read_positive_int("CODEX_TELEGRAM_POLL_TIMEOUT_SECONDS", 30),
+            telegram_request_attempts=read_positive_int(
+                "CODEX_TELEGRAM_REQUEST_ATTEMPTS",
+                DEFAULT_TELEGRAM_REQUEST_ATTEMPTS,
+            ),
             chat_action_interval_seconds=read_positive_int("CODEX_TELEGRAM_CHAT_ACTION_INTERVAL_SECONDS", 5),
             git_pull_timeout_seconds=read_positive_int("CODEX_TELEGRAM_GIT_PULL_TIMEOUT_SECONDS", 120),
             git_pull_interval_seconds=read_positive_int(
@@ -1114,10 +1119,13 @@ class TelegramClient:
         token: str,
         media_upload_chat_id: int | None = None,
         allowed_media_roots: tuple[Path, ...] = (),
+        *,
+        request_attempts: int = DEFAULT_TELEGRAM_REQUEST_ATTEMPTS,
     ) -> None:
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.media_upload_chat_id = media_upload_chat_id
         self.allowed_media_roots = allowed_media_roots
+        self.request_attempts = request_attempts
         self.uploaded_media_file_ids: dict[str, str] = {}
         self.uploaded_sticker_file_ids: dict[str, str] = {}
         self.uploaded_media_lock = threading.Lock()
@@ -1174,13 +1182,13 @@ class TelegramClient:
 
     async def _download_file(self, file_path: str, destination: Path) -> None:
         file_url = f"{self.base_url.replace('/bot', '/file/bot')}/{file_path}"
-        for attempt in range(TELEGRAM_REQUEST_ATTEMPTS):
+        for attempt in range(self.request_attempts):
             try:
                 await self._download_file_once(file_url, destination)
                 return
             except httpx.HTTPError as err:
                 if (
-                    attempt + 1 < TELEGRAM_REQUEST_ATTEMPTS
+                    attempt + 1 < self.request_attempts
                     and telegram_http_error_is_retryable(err)
                 ):
                     await self._wait_before_retry(
@@ -1672,7 +1680,7 @@ class TelegramClient:
         method: str,
         operation: Callable[[], Awaitable[Any]],
     ) -> Any:
-        for attempt in range(TELEGRAM_REQUEST_ATTEMPTS):
+        for attempt in range(self.request_attempts):
             try:
                 return await operation()
             except RetryAfter as err:
@@ -1686,7 +1694,7 @@ class TelegramClient:
             except Exception as err:
                 raise RuntimeError(f"Telegram {method} failed: {err}") from err
 
-            if attempt + 1 >= TELEGRAM_REQUEST_ATTEMPTS:
+            if attempt + 1 >= self.request_attempts:
                 raise RuntimeError(
                     f"Telegram {method} failed: {retry_error}",
                 ) from retry_error
@@ -1723,7 +1731,7 @@ class TelegramClient:
             for key, value in payload.items()
             if value is not None
         }
-        for attempt in range(TELEGRAM_REQUEST_ATTEMPTS):
+        for attempt in range(self.request_attempts):
             try:
                 if upload_roots:
                     response = await self._post_multipart_api(
@@ -1747,7 +1755,7 @@ class TelegramClient:
                     return result
                 retry_after = result.get("parameters", {}).get("retry_after")
                 if (
-                    attempt + 1 < TELEGRAM_REQUEST_ATTEMPTS
+                    attempt + 1 < self.request_attempts
                     and isinstance(retry_after, (int, float))
                 ):
                     await self._wait_before_retry(
@@ -1757,7 +1765,7 @@ class TelegramClient:
                     )
                     continue
                 if (
-                    attempt + 1 < TELEGRAM_REQUEST_ATTEMPTS
+                    attempt + 1 < self.request_attempts
                     and telegram_http_status_is_retryable(response.status_code)
                 ):
                     await self._wait_before_retry(
@@ -1770,7 +1778,7 @@ class TelegramClient:
                 raise RuntimeError(f"Telegram {method} failed: {description}")
             except httpx.HTTPError as err:
                 if (
-                    attempt + 1 < TELEGRAM_REQUEST_ATTEMPTS
+                    attempt + 1 < self.request_attempts
                     and telegram_http_error_is_retryable(err)
                 ):
                     await self._wait_before_retry(
@@ -5592,6 +5600,7 @@ class Bot:
             config.telegram_bot_token,
             config.media_upload_chat_id,
             allowed_media_roots,
+            request_attempts=config.telegram_request_attempts,
         )
         self.telegram.topic_history = self.topic_history
         self.codex = CodexRunner(config, self.telegram)

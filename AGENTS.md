@@ -67,6 +67,8 @@ Optional environment variables:
   missing or is not a directory is a startup error. Only existing non-empty regular files whose resolved paths remain
   inside this directory can be sent, up to 50 MiB per file. Symlinks and `..` paths cannot escape the directory.
 - `CODEX_TELEGRAM_POLL_TIMEOUT_SECONDS` - Telegram long-poll timeout; defaults to `30`.
+- `CODEX_TELEGRAM_REQUEST_ATTEMPTS` - positive integer setting the total number of attempts per Telegram request,
+  including the initial attempt. Defaults to `4` (three retries). Set it to `6` for five retries and restart the bot.
 - `CODEX_TELEGRAM_CHAT_ACTION_INTERVAL_SECONDS` - `sendChatAction` interval; defaults to `5`.
 - `CODEX_TELEGRAM_MAX_CONCURRENT_CHATS` - size of each worker pool used for chat-event processing and
   waiting on concurrent Codex turns; defaults to `16`.
@@ -125,10 +127,11 @@ concurrently, while messages in the same conversation retain Telegram update ord
 has an active Codex turn, a subsequent message is appended with
 app-server `turn/steer` instead of waiting for the turn to finish. If the turn completes at the same moment and
 the app-server rejects the steer, the message starts a new turn after completion and is not dropped.
-Telegram requests and attachment downloads are retried up to three times for rate limits, timeouts, and other
-transient network failures. A Telegram `RetryAfter` response supplies the exact delay; other transient failures
-wait half a second before each retry. Invalid requests and other semantic API failures are not retried. The
-optional `sendChatAction` notifications remain best-effort and are never retried.
+Telegram polling, other Bot API requests including multipart uploads, and attachment downloads use
+`CODEX_TELEGRAM_REQUEST_ATTEMPTS` for rate limits, timeouts, and other transient network failures. A Telegram
+`RetryAfter` response supplies the exact delay. Other transient failures wait half a second before each retry.
+Invalid requests and other semantic API failures stop immediately. Best-effort `sendChatAction` notifications
+make a single attempt.
 The bot handles `/compact` (and `/compact@botname` in groups) locally to compact the current Codex
 thread without starting a model turn. In a forum, the command applies only to its topic. `/archive` archives
 the current Codex thread and removes its

@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
 from telegram import Update
-from telegram.error import BadRequest, NetworkError, RetryAfter
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 
 from bot import (  # noqa: E402
     ATTACHMENT_CACHE_DIRECTORY,
@@ -519,6 +519,34 @@ class TelegramReplyTest(unittest.TestCase):
         self.assertEqual(operation.await_count, 4)
         self.assertEqual(sleep.await_count, 3)
         sleep.assert_has_awaits([call(0.5), call(0.5), call(0.5)])
+
+    def test_configured_request_attempts_apply_to_polling_timeouts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            environment = {
+                "TELEGRAM_BOT_TOKEN": "test-token",
+                "TELEGRAM_ALLOWED_CHAT_IDS": "-1001",
+                "CODEX_TELEGRAM_REPO_DIR": temp_dir,
+                "CODEX_TELEGRAM_REQUEST_ATTEMPTS": "6",
+            }
+            with (
+                patch.dict(os.environ, environment, clear=True),
+                patch("bot.configured_writable_roots", return_value=[]),
+            ):
+                bot = Bot(Config.from_env())
+            self.addCleanup(bot.update_executor.shutdown)
+            self.addCleanup(bot.turn_executor.shutdown)
+
+            bot.telegram.bot = MagicMock()
+            bot.telegram.bot.get_updates = AsyncMock(side_effect=TimedOut())
+            with (
+                patch.object(bot.telegram, "_submit", side_effect=asyncio.run),
+                patch("bot.asyncio.sleep", new=AsyncMock()) as sleep,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Telegram getUpdates failed"):
+                    bot.telegram.get_updates(None, bot.config.poll_timeout_seconds)
+
+        self.assertEqual(bot.telegram.bot.get_updates.await_count, 6)
+        self.assertEqual(sleep.await_count, 5)
 
     def test_ptb_api_uses_retry_after_delay(self) -> None:
         client = TelegramClient("test-token")
